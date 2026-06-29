@@ -1,12 +1,11 @@
 """FastAPI endpoints for Shazam Live."""
 from __future__ import annotations
-from typing import Dict, Any
-from fastapi import APIRouter, HTTPException
+from typing import List, Optional
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 
 
 def register_live_api(app, manager) -> APIRouter:
-    """Register all /api/* endpoints. Returns the router."""
     router = APIRouter(prefix="/api")
     
     @router.get("/status")
@@ -22,7 +21,7 @@ def register_live_api(app, manager) -> APIRouter:
         return manager.get_paper_stats()
     
     class EngineSelection(BaseModel):
-        engine: str  # "v41_stable" or "entry_only"
+        engine: str
     
     @router.post("/active-engine")
     def set_active_engine(body: EngineSelection):
@@ -31,25 +30,44 @@ def register_live_api(app, manager) -> APIRouter:
             raise HTTPException(400, result.get("error", "failed"))
         return result
     
+    class DisplayMode(BaseModel):
+        mode: str  # "single" or "compare"
+    
+    @router.post("/display-mode")
+    def set_display_mode(body: DisplayMode):
+        result = manager.set_display_mode(body.mode)
+        if not result.get("ok"):
+            raise HTTPException(400, result.get("error", "failed"))
+        return result
+    
+    class ShowMarkers(BaseModel):
+        show: bool
+    
+    @router.post("/show-markers")
+    def set_show_markers(body: ShowMarkers):
+        return manager.set_show_markers(body.show)
+    
     class EntryOnlySettings(BaseModel):
-        buy_tp_pct: float = None
-        buy_sl_pct: float = None
-        sell_tp_pct: float = None
-        sell_sl_pct: float = None
-        max_hold_bars: int = None
-        enabled: bool = None
+        buy_tp_pct: Optional[float] = None
+        buy_sl_pct: Optional[float] = None
+        sell_tp_pct: Optional[float] = None
+        sell_sl_pct: Optional[float] = None
+        max_hold_bars: Optional[int] = None
+        enabled: Optional[bool] = None
+        exit_mode: Optional[str] = None  # "ladder" / "manual" / "disabled"
+        use_ladder: Optional[bool] = None
+        ladder: Optional[List[List[float]]] = None  # [[trigger, lock], ...]
     
     @router.post("/entry-only-settings")
     def update_entry_only_settings(body: EntryOnlySettings):
-        # Only forward non-None values
         settings = {k: v for k, v in body.dict().items() if v is not None}
         return manager.update_entry_only_settings(settings)
     
     class SuperTrendSettings(BaseModel):
-        period: int = None
-        multiplier: float = None
-        offset_pct: float = None
-        thickness: int = None
+        period: Optional[int] = None
+        multiplier: Optional[float] = None
+        offset_pct: Optional[float] = None
+        thickness: Optional[int] = None
     
     @router.post("/supertrend-settings")
     def update_supertrend_settings(body: SuperTrendSettings):
@@ -70,6 +88,20 @@ def register_live_api(app, manager) -> APIRouter:
     @router.post("/close-position")
     def close_position(body: ClosePos):
         return manager.close_position_manual(body.engine)
+    
+    @router.get("/report/{engine_name}")
+    def get_report(engine_name: str):
+        """Download report ZIP."""
+        if engine_name not in ("v41_stable", "entry_only"):
+            raise HTTPException(404, "unknown engine")
+        data = manager.generate_report(engine_name)
+        from datetime import datetime
+        filename = f"shazam_report_{engine_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.zip"
+        return Response(
+            content=data,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
     
     app.include_router(router)
     return router
