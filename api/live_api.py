@@ -35,6 +35,8 @@ class EntryOnlySettings(BaseModel):
     exit_mode: Optional[str] = None
     use_ladder: Optional[bool] = None
     ladder: Optional[List[List[float]]] = None
+    cooldown_bars: Optional[int] = None
+    smart_reverse: Optional[bool] = None
 
 
 class SuperTrendSettings(BaseModel):
