@@ -19,8 +19,10 @@ class DisplayMode(BaseModel):
     mode: str  # "single" or "compare"
 
 
-class ShowMarkers(BaseModel):
-    show: bool
+class ShowToggles(BaseModel):
+    show_signals: Optional[bool] = None
+    show_trades: Optional[bool] = None
+    show_tp_sl: Optional[bool] = None
 
 
 class EntryOnlySettings(BaseModel):
@@ -81,8 +83,12 @@ def register_live_api(app, manager) -> APIRouter:
         return result
     
     @router.post("/show-markers")
-    def set_show_markers(body: ShowMarkers):
-        return manager.set_show_markers(body.show)
+    def set_show_markers(body: ShowToggles):
+        return manager.set_show_toggles(
+            show_signals=body.show_signals,
+            show_trades=body.show_trades,
+            show_tp_sl=body.show_tp_sl,
+        )
     
     @router.post("/entry-only-settings")
     def update_entry_only_settings(body: EntryOnlySettings):
