@@ -11,7 +11,6 @@
 
 <div class="app">
 
-  <!-- Header -->
   <header class="top">
     <div class="title-row">
       <div class="brand">
@@ -23,45 +22,110 @@
     <button class="settings-btn" onclick="toggleSettings()">⚙</button>
   </header>
 
-  <!-- Settings Panel -->
+  <!-- Settings Panel (Collapsible Sections) -->
   <div id="settingsPanel" class="settings-panel hidden">
-    <div class="setting-row">
-      <div class="setting-group">
-        <label>الرمز</label>
-        <select id="symbolSelect" disabled>
-          <option value="BTCUSDT" selected>BTC/USDT</option>
-        </select>
+    
+    <!-- Section: Display -->
+    <div class="settings-section">
+      <div class="section-header" onclick="toggleSection('sec_display')">
+        <span>🖥 العرض</span>
+        <span class="chevron" id="chev_sec_display">▾</span>
       </div>
-      <div class="setting-group">
-        <label>الإطار الزمني</label>
-        <select id="timeframeSelect" disabled>
-          <option value="5m" selected>5m</option>
-        </select>
+      <div class="section-body" id="sec_display">
+        <div class="setting-row">
+          <div class="setting-group">
+            <label>وضع التشغيل</label>
+            <select id="displayMode" onchange="applyDisplayMode()">
+              <option value="single">واحد (المحرك المختار)</option>
+              <option value="compare">مقارنة (كلا المحركين)</option>
+            </select>
+          </div>
+          <div class="setting-group">
+            <label>إظهار الإشارات</label>
+            <select id="showMarkers" onchange="applyShowMarkers()">
+              <option value="true">نعم</option>
+              <option value="false">إخفاء</option>
+            </select>
+          </div>
+        </div>
+        <div class="hint" id="modeHint">
+          🔹 وضع واحد: المحرك المختار يظهر على الشارت<br>
+          🔸 مقارنة: كلا المحركين يعملان، الإشارات لا تظهر بالشارت — للمقارنة فقط
+        </div>
       </div>
     </div>
     
-    <div class="settings-divider">إعدادات SuperTrend</div>
-    <div class="setting-row">
-      <div class="setting-group">
-        <label>الفترة (ATR)</label>
-        <input type="number" id="stPeriod" value="10" min="2" max="50">
+    <!-- Section: SuperTrend -->
+    <div class="settings-section">
+      <div class="section-header" onclick="toggleSection('sec_st')">
+        <span>📈 SuperTrend</span>
+        <span class="chevron" id="chev_sec_st">▾</span>
       </div>
-      <div class="setting-group">
-        <label>المضاعف</label>
-        <input type="number" id="stMultiplier" value="3.0" step="0.1" min="0.5" max="10">
+      <div class="section-body" id="sec_st">
+        <div class="setting-row">
+          <div class="setting-group">
+            <label>الفترة (ATR)</label>
+            <input type="number" id="stPeriod" value="10" min="2" max="50">
+          </div>
+          <div class="setting-group">
+            <label>المضاعف</label>
+            <input type="number" id="stMultiplier" value="3.0" step="0.1" min="0.5" max="10">
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-group">
+            <label>البعد عن الشموع (%)</label>
+            <input type="number" id="stOffset" value="0" step="0.05" min="0" max="2">
+          </div>
+          <div class="setting-group">
+            <label>سماكة الخط</label>
+            <input type="number" id="stThickness" value="2" min="1" max="6">
+          </div>
+        </div>
+        <button class="apply-btn" onclick="applySupertrendSettings()">تطبيق</button>
       </div>
     </div>
-    <div class="setting-row">
-      <div class="setting-group">
-        <label>البعد عن الشموع (%)</label>
-        <input type="number" id="stOffset" value="0" step="0.05" min="0" max="2">
+    
+    <!-- Section: Reports -->
+    <div class="settings-section">
+      <div class="section-header" onclick="toggleSection('sec_reports')">
+        <span>📊 التقارير</span>
+        <span class="chevron" id="chev_sec_reports">▾</span>
       </div>
-      <div class="setting-group">
-        <label>سماكة الخط</label>
-        <input type="number" id="stThickness" value="2" min="1" max="6">
+      <div class="section-body" id="sec_reports">
+        <div class="hint">
+          يصدّر تقرير ZIP لكل محرك: الإشارات + الصفقات + المعادلات + الـDNA + الإحصائيات
+        </div>
+        <button class="apply-btn" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="downloadReport('v41_stable')">
+          📥 تصدير تقرير v4.1 Stable
+        </button>
+        <button class="apply-btn" style="background:linear-gradient(135deg,#c084fc,#9333ea)" onclick="downloadReport('entry_only')">
+          📥 تصدير تقرير Entry-Only
+        </button>
       </div>
     </div>
-    <button class="apply-btn" onclick="applySupertrendSettings()">تطبيق SuperTrend</button>
+    
+    <!-- Section: System Info -->
+    <div class="settings-section">
+      <div class="section-header" onclick="toggleSection('sec_sys')">
+        <span>ℹ النظام</span>
+        <span class="chevron" id="chev_sec_sys">▾</span>
+      </div>
+      <div class="section-body" id="sec_sys">
+        <div class="setting-row">
+          <div class="setting-group">
+            <label>الرمز</label>
+            <select disabled><option>BTCUSDT</option></select>
+          </div>
+          <div class="setting-group">
+            <label>الإطار الزمني</label>
+            <select disabled><option>5m</option></select>
+          </div>
+        </div>
+        <div class="hint" id="sysInfo">--</div>
+      </div>
+    </div>
+    
   </div>
 
   <!-- Chart -->
@@ -80,7 +144,7 @@
     <div id="chart"></div>
   </section>
 
-  <!-- Engine Selector -->
+  <!-- Engine Tabs -->
   <div class="engine-tabs">
     <button class="engine-tab active" data-engine="v41_stable" onclick="selectEngine('v41_stable')">
       <span class="tab-name">v4.1 Stable</span>
@@ -88,7 +152,7 @@
     </button>
     <button class="engine-tab" data-engine="entry_only" onclick="selectEngine('entry_only')">
       <span class="tab-name">Entry-Only</span>
-      <span class="tab-sub">دخول فقط + تحكم يدوي</span>
+      <span class="tab-sub">دخول فقط + Step Ladder</span>
     </button>
   </div>
 
@@ -101,40 +165,22 @@
       </div>
       <span class="status-pill" id="status_v41">جاهز</span>
     </div>
-    
     <div class="card-body">
       <div class="stats-grid">
-        <div class="stat">
-          <div class="stat-label">الرصيد</div>
-          <div class="stat-value" id="v41_balance">$10,000</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">PnL %</div>
-          <div class="stat-value" id="v41_pnl_pct">+0.00%</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">عدد الصفقات</div>
-          <div class="stat-value" id="v41_trades">0</div>
-        </div>
+        <div class="stat"><div class="stat-label">الرصيد</div><div class="stat-value" id="v41_balance">$10,000</div></div>
+        <div class="stat"><div class="stat-label">PnL %</div><div class="stat-value" id="v41_pnl_pct">+0.00%</div></div>
+        <div class="stat"><div class="stat-label">الصفقات</div><div class="stat-value" id="v41_trades">0</div></div>
       </div>
-      
       <div class="stats-row">
-        <div class="mini-stat win">
-          <span>فاز</span><b id="v41_wins">0</b>
-        </div>
-        <div class="mini-stat loss">
-          <span>خسر</span><b id="v41_losses">0</b>
-        </div>
-        <div class="mini-stat">
-          <span>WR</span><b id="v41_wr">0%</b>
-        </div>
+        <div class="mini-stat"><span>الإشارات</span><b id="v41_signals">0</b></div>
+        <div class="mini-stat win"><span>فاز</span><b id="v41_wins">0</b></div>
+        <div class="mini-stat loss"><span>خسر</span><b id="v41_losses">0</b></div>
+        <div class="mini-stat"><span>WR</span><b id="v41_wr">0%</b></div>
       </div>
-      
       <div class="floating-pnl" id="v41_floating_box" style="display:none">
         <div class="floating-label">صفقة مفتوحة <span id="v41_open_side"></span></div>
         <div class="floating-value" id="v41_floating_pnl">+0.00%</div>
       </div>
-      
       <div class="capital-input">
         <label>مبلغ التداول الافتراضي ($)</label>
         <div class="input-row">
@@ -150,76 +196,114 @@
     <div class="card-head">
       <div class="card-title">
         <span class="badge badge-entry">ENTRY-ONLY</span>
-        <span>Shazam Entry-Only — التحكم اليدوي</span>
+        <span>Shazam Entry-Only — Step Ladder</span>
       </div>
       <span class="status-pill" id="status_entry_only">جاهز</span>
     </div>
-    
     <div class="card-body">
       <div class="stats-grid">
-        <div class="stat">
-          <div class="stat-label">الرصيد</div>
-          <div class="stat-value" id="eo_balance">$10,000</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">PnL %</div>
-          <div class="stat-value" id="eo_pnl_pct">+0.00%</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">عدد الصفقات</div>
-          <div class="stat-value" id="eo_trades">0</div>
-        </div>
+        <div class="stat"><div class="stat-label">الرصيد</div><div class="stat-value" id="eo_balance">$10,000</div></div>
+        <div class="stat"><div class="stat-label">PnL %</div><div class="stat-value" id="eo_pnl_pct">+0.00%</div></div>
+        <div class="stat"><div class="stat-label">الصفقات</div><div class="stat-value" id="eo_trades">0</div></div>
       </div>
-      
       <div class="stats-row">
+        <div class="mini-stat"><span>الإشارات</span><b id="eo_signals">0</b></div>
         <div class="mini-stat win"><span>فاز</span><b id="eo_wins">0</b></div>
         <div class="mini-stat loss"><span>خسر</span><b id="eo_losses">0</b></div>
         <div class="mini-stat"><span>WR</span><b id="eo_wr">0%</b></div>
       </div>
-      
       <div class="floating-pnl" id="eo_floating_box" style="display:none">
         <div class="floating-label">صفقة مفتوحة <span id="eo_open_side"></span></div>
         <div class="floating-value" id="eo_floating_pnl">+0.00%</div>
+        <div id="eo_lock_info" class="lock-info"></div>
         <button class="close-btn" onclick="closeManually('entry_only')">إغلاق يدوي</button>
       </div>
       
-      <!-- Entry-Only specific settings -->
-      <div class="eo-settings">
-        <div class="settings-divider">إعدادات الخروج (Entry-Only)</div>
-        <div class="setting-row">
-          <div class="setting-group">
-            <label>BUY TP (%)</label>
-            <input type="number" id="eo_buy_tp" value="0.10" step="0.01" min="0.01">
+      <!-- Entry-Only Settings (Collapsible) -->
+      <div class="eo-settings-wrapper">
+        <div class="settings-section">
+          <div class="section-header" onclick="toggleSection('sec_eo_exit')">
+            <span>⚙ إعدادات الخروج</span>
+            <span class="chevron" id="chev_sec_eo_exit">▾</span>
           </div>
-          <div class="setting-group">
-            <label>BUY SL (%)</label>
-            <input type="number" id="eo_buy_sl" value="1.50" step="0.05" min="0.1">
+          <div class="section-body" id="sec_eo_exit">
+            
+            <div class="setting-row">
+              <div class="setting-group">
+                <label>وضع الحماية</label>
+                <select id="eo_exit_mode" onchange="updateExitModeUI()">
+                  <option value="ladder" selected>Step Ladder (افتراضي)</option>
+                  <option value="manual">يدوي (TP/SL ثابت)</option>
+                  <option value="disabled">معطّل</option>
+                </select>
+              </div>
+              <div class="setting-group">
+                <label>تشغيل البوت</label>
+                <select id="eo_enabled">
+                  <option value="true" selected>مفعّل</option>
+                  <option value="false">متوقف</option>
+                </select>
+              </div>
+            </div>
+            
+            <!-- Step Ladder Editor -->
+            <div id="ladderSection">
+              <div class="ladder-title">جدول الحماية المتدرج (Trigger% → Lock%)</div>
+              <div id="ladderRows"></div>
+              <button class="apply-btn" style="background:var(--surface);border:1px solid var(--border)" onclick="resetLadderDefault()">↺ افتراضي</button>
+              <div class="hint">
+                عند بلوغ الـTrigger، يثبت ربح Lock. لو السعر طاح وكسر الـLock → خروج.<br>
+                فوق آخر مستوى: Lock = Peak × 72%
+              </div>
+            </div>
+            
+            <!-- Manual TP/SL -->
+            <div id="manualSection" style="display:none">
+              <div class="setting-row">
+                <div class="setting-group">
+                  <label>BUY TP (%)</label>
+                  <input type="number" id="eo_buy_tp" value="0.10" step="0.01" min="0.01">
+                </div>
+                <div class="setting-group">
+                  <label>BUY SL (%)</label>
+                  <input type="number" id="eo_buy_sl" value="1.50" step="0.05" min="0.1">
+                </div>
+              </div>
+              <div class="setting-row">
+                <div class="setting-group">
+                  <label>SELL TP (%)</label>
+                  <input type="number" id="eo_sell_tp" value="0.05" step="0.01" min="0.01">
+                </div>
+                <div class="setting-group">
+                  <label>SELL SL (%)</label>
+                  <input type="number" id="eo_sell_sl" value="0.75" step="0.05" min="0.1">
+                </div>
+              </div>
+            </div>
+            
+            <!-- Always-visible SL (safety net) and max hold -->
+            <div class="settings-divider">شبكة الأمان (SL)</div>
+            <div class="setting-row">
+              <div class="setting-group">
+                <label>BUY SL (%)</label>
+                <input type="number" id="eo_buy_sl_global" value="1.50" step="0.05" min="0.1">
+              </div>
+              <div class="setting-group">
+                <label>SELL SL (%)</label>
+                <input type="number" id="eo_sell_sl_global" value="0.75" step="0.05" min="0.1">
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-group">
+                <label>Max Hold (شموع)</label>
+                <input type="number" id="eo_max_hold" value="144" min="10" max="500">
+              </div>
+              <div class="setting-group"><label>&nbsp;</label><span class="hint" style="padding:8px 0">SL يعمل دائماً كحماية</span></div>
+            </div>
+            
+            <button class="apply-btn" onclick="applyEntryOnlySettings()">💾 تطبيق الإعدادات</button>
           </div>
         </div>
-        <div class="setting-row">
-          <div class="setting-group">
-            <label>SELL TP (%)</label>
-            <input type="number" id="eo_sell_tp" value="0.05" step="0.01" min="0.01">
-          </div>
-          <div class="setting-group">
-            <label>SELL SL (%)</label>
-            <input type="number" id="eo_sell_sl" value="0.75" step="0.05" min="0.1">
-          </div>
-        </div>
-        <div class="setting-row">
-          <div class="setting-group">
-            <label>Max Hold</label>
-            <input type="number" id="eo_max_hold" value="144" min="10" max="500">
-          </div>
-          <div class="setting-group">
-            <label>الخروج التلقائي</label>
-            <select id="eo_enabled">
-              <option value="true" selected>مفعّل</option>
-              <option value="false">يدوي فقط</option>
-            </select>
-          </div>
-        </div>
-        <button class="apply-btn" onclick="applyEntryOnlySettings()">تطبيق الإعدادات</button>
       </div>
       
       <div class="capital-input">
@@ -234,9 +318,7 @@
 
   <!-- Recent Signals -->
   <section class="panel">
-    <div class="card-head">
-      <div class="card-title"><span>آخر الإشارات</span></div>
-    </div>
+    <div class="card-head"><div class="card-title"><span>آخر الإشارات</span></div></div>
     <div id="signalsList" class="signals-list"></div>
   </section>
 
