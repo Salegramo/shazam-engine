@@ -1,19 +1,67 @@
 """Paper Bot — virtual trading per engine.
 
-Supports:
-  - v4.1 stable: locked exit (TP/SL/trail/max_hold) — fully automated
-  - Entry-Only: fixed TP/SL (user-adjustable) — manual close option
+v4.1 Stable: micro-trail (asymmetric, BUY vs SELL)
+Entry-Only:  Step Ladder protection (configurable from UI)
 
-Tracks:
-  - balance, total_pnl_pct, total_pnl_usd
-  - wins, losses, neutrals
-  - chart markers (entry, exit)
-  - open position (with floating PnL)
+Step Ladder default:
+    0.10% → 0.06%
+    0.18% → 0.11%
+    0.28% → 0.18%
+    0.40% → 0.27%
+    0.55% → 0.38%
+    0.75% → 0.52%
+    1.00% → 0.72%
+    > 1.00%: ratio-based (peak × 0.72)
 """
 from __future__ import annotations
 import time
-from typing import Optional, Dict, Any, List
 import threading
+from typing import Optional, Dict, Any, List, Tuple
+
+
+# Default step ladder
+DEFAULT_LADDER: List[Tuple[float, float]] = [
+    (0.10, 0.06),
+    (0.18, 0.11),
+    (0.28, 0.18),
+    (0.40, 0.27),
+    (0.55, 0.38),
+    (0.75, 0.52),
+    (1.00, 0.72),
+]
+# Ratio for above ladder max
+LADDER_OVERFLOW_RATIO = 0.72
+
+
+def compute_lock_from_ladder(peak_pnl_pct: float, ladder: List[Tuple[float, float]]) -> Optional[float]:
+    """Given current peak_pnl%, return the locked-profit% (or None if peak hasn't reached first trigger).
+    
+    Behavior:
+        peak < ladder[0].trigger: no lock
+        peak between two triggers: lock = the LOWER trigger's lock
+        peak >= max trigger: lock = peak * overflow_ratio
+    """
+    if not ladder:
+        return None
+    sorted_ladder = sorted(ladder, key=lambda x: x[0])
+    
+    # Below first trigger
+    if peak_pnl_pct < sorted_ladder[0][0]:
+        return None
+    
+    # Above max trigger
+    max_trigger, _ = sorted_ladder[-1]
+    if peak_pnl_pct >= max_trigger:
+        return peak_pnl_pct * LADDER_OVERFLOW_RATIO
+    
+    # Find the highest trigger <= peak
+    current_lock = sorted_ladder[0][1]
+    for trig, lock in sorted_ladder:
+        if peak_pnl_pct >= trig:
+            current_lock = lock
+        else:
+            break
+    return current_lock
 
 
 class PaperBot:
@@ -21,24 +69,20 @@ class PaperBot:
         self.engine_name = engine_name
         self.initial_balance = float(initial_balance)
         self.balance = float(initial_balance)
-        self.position_size_usd = self.balance  # use full balance per trade (paper)
+        self.position_size_usd = self.balance
         
-        # Trades history
         self.trades: List[Dict[str, Any]] = []
-        
-        # Current open position
         self.open_position: Optional[Dict[str, Any]] = None
-        
-        # Current market state (updated on every tick)
         self.current_price: Optional[float] = None
         self.current_time_ms: Optional[int] = None
         
-        # Stats
         self.wins = 0
         self.losses = 0
         self.neutrals = 0
         
-        # Lock
+        # Signals tracked (for reports - even if no trade was opened)
+        self.signals_received: List[Dict[str, Any]] = []
+        
         self._lock = threading.Lock()
     
     # ---------- Public API ----------
@@ -53,47 +97,53 @@ class PaperBot:
             self.wins = 0
             self.losses = 0
             self.neutrals = 0
+            self.signals_received = []
+    
+    def record_signal(self, signal: Dict[str, Any]):
+        """Record a signal received (for reporting), regardless of trade execution."""
+        with self._lock:
+            self.signals_received.append(dict(signal))
+            if len(self.signals_received) > 10000:
+                self.signals_received = self.signals_received[-10000:]
     
     def update_current_price(self, price: float, time_ms: int):
-        """Called on every tick. Updates current price + checks exit conditions."""
         with self._lock:
             self.current_price = float(price)
             self.current_time_ms = int(time_ms)
-            
-            # Check if open position should exit (TP/SL/trail/max_hold)
             if self.open_position:
                 self._check_exit(price, time_ms)
     
     def handle_signal(
         self,
         signal: Dict[str, Any],
-        tp_pct: float,
-        sl_pct: float,
+        tp_pct: float = 0.10,
+        sl_pct: float = 1.50,
         tp_hard_pct: Optional[float] = None,
         trail_giveback: Optional[float] = None,
         max_hold_bars: int = 144,
         use_trail: bool = False,
+        ladder: Optional[List[Tuple[float, float]]] = None,
+        use_ladder: bool = False,
     ):
         """Process a new entry signal.
         
-        If there's an open position with the OPPOSITE side, close it first then open new.
-        If same side, ignore (bridge).
+        If open position with OPPOSITE side: close first then open new.
+        If same side: ignore (bridge).
+        
+        Args:
+            use_trail: v4.1 micro-trail exit
+            use_ladder: Step Ladder protection (Entry-Only)
         """
         with self._lock:
             side = signal["side"]
             entry_price = float(signal["price"])
             entry_time = int(signal["timestamp_ms"])
             
-            # If open position exists
             if self.open_position is not None:
                 if self.open_position["side"] == side:
-                    # Same side: ignore (this is a bridge in entry-only)
-                    return
-                else:
-                    # Opposite side: close current first
-                    self._close_position(entry_price, entry_time, reason="REVERSE")
+                    return  # bridge
+                self._close_position(entry_price, entry_time, reason="REVERSE")
             
-            # Open new position
             if side == "BUY":
                 tp_price = entry_price * (1 + tp_pct / 100.0)
                 sl_price = entry_price * (1 - sl_pct / 100.0)
@@ -117,9 +167,14 @@ class PaperBot:
                 "trail_giveback": trail_giveback,
                 "max_hold_bars": max_hold_bars,
                 "use_trail": use_trail,
+                "use_ladder": use_ladder,
+                "ladder": ladder or DEFAULT_LADDER,
                 "peak_pnl_pct": 0.0,
+                "current_lock_pct": None,  # current locked profit% (None until first trigger)
                 "confidence": signal.get("confidence", "MEDIUM"),
                 "rule_window": signal.get("rule_window", 0),
+                "rule_formula": signal.get("rule_formula", ""),
+                "rule_wr": signal.get("rule_wr", 0.0),
             }
     
     def get_open_position(self) -> Optional[Dict[str, Any]]:
@@ -138,7 +193,6 @@ class PaperBot:
             total_trades = len(self.trades)
             wr = (self.wins / max(1, self.wins + self.losses)) * 100 if (self.wins + self.losses) > 0 else 0.0
             
-            # Floating PnL for open position
             floating_pnl_pct = 0.0
             floating_pnl_usd = 0.0
             if self.open_position and self.current_price is not None:
@@ -164,6 +218,7 @@ class PaperBot:
                 "losses": self.losses,
                 "neutrals": self.neutrals,
                 "win_rate_pct": wr,
+                "signals_received_count": len(self.signals_received),
                 "has_open_position": self.open_position is not None,
                 "open_position": dict(self.open_position) if self.open_position else None,
                 "floating_pnl_pct": floating_pnl_pct,
@@ -172,104 +227,127 @@ class PaperBot:
             }
     
     def get_chart_markers(self, min_time: int = 0) -> List[Dict[str, Any]]:
-        """Return entry/exit markers for chart."""
         with self._lock:
             markers = []
             for t in self.trades:
                 if t["entry_time"] >= min_time:
                     markers.append({
-                        "time": t["entry_time"],
-                        "type": "entry",
-                        "side": t["side"],
-                        "price": t["entry_price"],
+                        "time": t["entry_time"], "type": "entry",
+                        "side": t["side"], "price": t["entry_price"],
                     })
                     markers.append({
-                        "time": t["exit_time"],
-                        "type": "exit",
-                        "side": t["side"],
-                        "price": t["exit_price"],
-                        "pnl_pct": t["pnl_pct"],
-                        "reason": t["reason"],
+                        "time": t["exit_time"], "type": "exit",
+                        "side": t["side"], "price": t["exit_price"],
+                        "pnl_pct": t["pnl_pct"], "reason": t["reason"],
                     })
-            # Include current open position entry
             if self.open_position and self.open_position["entry_time"] >= min_time:
                 markers.append({
                     "time": self.open_position["entry_time"],
-                    "type": "entry",
-                    "side": self.open_position["side"],
-                    "price": self.open_position["entry_price"],
-                    "open": True,
+                    "type": "entry", "side": self.open_position["side"],
+                    "price": self.open_position["entry_price"], "open": True,
                 })
             return markers
+    
+    def get_report_data(self) -> Dict[str, Any]:
+        """All data for the export report."""
+        with self._lock:
+            return {
+                "engine_name": self.engine_name,
+                "signals": list(self.signals_received),
+                "trades": list(self.trades),
+                "stats": self.get_stats_unlocked(),
+            }
+    
+    def get_stats_unlocked(self) -> Dict[str, Any]:
+        """Same as get_stats but without acquiring lock (caller must hold)."""
+        total_trades = len(self.trades)
+        wr = (self.wins / max(1, self.wins + self.losses)) * 100 if (self.wins + self.losses) > 0 else 0.0
+        total_pnl_usd = self.balance - self.initial_balance
+        total_pnl_pct = (total_pnl_usd / self.initial_balance) * 100 if self.initial_balance > 0 else 0
+        return {
+            "engine_name": self.engine_name,
+            "initial_balance": self.initial_balance,
+            "balance": self.balance,
+            "total_pnl_usd": total_pnl_usd,
+            "total_pnl_pct": total_pnl_pct,
+            "trades_total": total_trades,
+            "wins": self.wins, "losses": self.losses, "neutrals": self.neutrals,
+            "win_rate_pct": wr,
+            "signals_received_count": len(self.signals_received),
+        }
     
     # ---------- Internal ----------
     
     def _check_exit(self, price: float, time_ms: int):
-        """Check if open position should exit (called on every tick)."""
+        """Check if open position should exit (assumes lock held)."""
         p = self.open_position
         if p is None:
             return
         
         side = p["side"]
         ep = p["entry_price"]
-        
-        if side == "BUY":
-            pnl_pct = (price - ep) / ep * 100
-        else:
-            pnl_pct = (ep - price) / ep * 100
+        pnl_pct = (price - ep) / ep * 100 if side == "BUY" else (ep - price) / ep * 100
         
         # Track peak
         if pnl_pct > p["peak_pnl_pct"]:
             p["peak_pnl_pct"] = pnl_pct
         
-        # SL check
+        # SL (always active as safety net)
         if pnl_pct <= -p["sl_pct"]:
-            sl_price = p["sl_price"]
-            self._close_position(sl_price, time_ms, reason="STOP_LOSS")
+            self._close_position(p["sl_price"], time_ms, reason="STOP_LOSS")
             return
         
-        # TP HARD
+        # TP_HARD (v4.1 only)
         if p.get("tp_hard_pct") and pnl_pct >= p["tp_hard_pct"]:
             self._close_position(p["tp_hard_price"], time_ms, reason="TP_HARD")
             return
         
-        # Trail (v4.1 stable only)
-        if p.get("use_trail") and p.get("trail_giveback"):
+        # ── EXIT STRATEGY 1: Step Ladder (Entry-Only with use_ladder=True) ──
+        if p.get("use_ladder") and p.get("ladder"):
+            ladder = p["ladder"]
+            # Update the lock based on current peak
+            new_lock = compute_lock_from_ladder(p["peak_pnl_pct"], ladder)
+            if new_lock is not None:
+                # Only move lock UP (never down)
+                if p["current_lock_pct"] is None or new_lock > p["current_lock_pct"]:
+                    p["current_lock_pct"] = new_lock
+            
+            # Check if price hit the current lock (came back down)
+            if p["current_lock_pct"] is not None and pnl_pct <= p["current_lock_pct"]:
+                lock_price = ep * (1 + p["current_lock_pct"] / 100.0) if side == "BUY" else ep * (1 - p["current_lock_pct"] / 100.0)
+                self._close_position(lock_price, time_ms, reason="LADDER_LOCK")
+                return
+        
+        # ── EXIT STRATEGY 2: Micro-trail (v4.1 stable) ──
+        elif p.get("use_trail") and p.get("trail_giveback"):
             if p["peak_pnl_pct"] >= p["tp_pct"]:
-                # trail armed
                 if pnl_pct <= p["peak_pnl_pct"] - p["trail_giveback"]:
                     exit_pnl = max(p["peak_pnl_pct"] - p["trail_giveback"], p["tp_pct"])
-                    if side == "BUY":
-                        exit_price = ep * (1 + exit_pnl / 100.0)
-                    else:
-                        exit_price = ep * (1 - exit_pnl / 100.0)
+                    exit_price = ep * (1 + exit_pnl / 100.0) if side == "BUY" else ep * (1 - exit_pnl / 100.0)
                     self._close_position(exit_price, time_ms, reason="TRAIL_LOCK")
                     return
+        
+        # ── EXIT STRATEGY 3: Fixed TP (manual mode) ──
         else:
-            # Entry-Only mode: fixed TP
             if pnl_pct >= p["tp_pct"]:
                 self._close_position(p["tp_price"], time_ms, reason="TAKE_PROFIT")
                 return
         
-        # Max hold (approximate via time)
-        bars_held = (time_ms - p["entry_time_ms"]) // (5 * 60 * 1000)  # assumes 5m candles
+        # Max hold (5m candle assumption)
+        bars_held = (time_ms - p["entry_time_ms"]) // (5 * 60 * 1000)
         if bars_held >= p["max_hold_bars"]:
             self._close_position(price, time_ms, reason="MAX_HOLD")
             return
     
     def _close_position(self, exit_price: float, exit_time_ms: int, reason: str = "MANUAL"):
-        """Close open position (assumes lock is held)."""
+        """Close (assumes lock held)."""
         p = self.open_position
         if p is None:
             return
         
         side = p["side"]
         ep = p["entry_price"]
-        if side == "BUY":
-            pnl_pct = (exit_price - ep) / ep * 100
-        else:
-            pnl_pct = (ep - exit_price) / ep * 100
-        
+        pnl_pct = (exit_price - ep) / ep * 100 if side == "BUY" else (ep - exit_price) / ep * 100
         pnl_usd = self.position_size_usd * pnl_pct / 100.0
         self.balance += pnl_usd
         
@@ -293,6 +371,9 @@ class PaperBot:
             "result": result,
             "confidence": p.get("confidence"),
             "rule_window": p.get("rule_window"),
+            "rule_formula": p.get("rule_formula"),
+            "rule_wr": p.get("rule_wr"),
+            "peak_pnl_pct": p.get("peak_pnl_pct", 0.0),
         }
         self.trades.append(trade)
         self.open_position = None

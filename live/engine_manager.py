@@ -1,46 +1,35 @@
-"""Engine Manager — coordinates both engines + Binance + Paper Bot.
-
-Architecture:
-  Binance WS → candles buffer → DNA (rolling) → Mining (once at warmup)
-                                           ↓
-                              Active engine scan per candle
-                                           ↓
-                                    Signal → Paper Bot
-"""
+"""Engine Manager — coordinates both engines + Binance + Paper Bots + Reports."""
 from __future__ import annotations
 import threading
 import time
-from typing import Optional, Dict, Any, List, Callable
-from collections import deque
+import json
+import io
+import zipfile
+from typing import Optional, Dict, Any, List
+from datetime import datetime
 
 import pandas as pd
 import numpy as np
 
 from live.binance_provider import fetch_klines_rest, BinanceWSClient
 from live.dna_builder_live import build_dna_from_candles
-from live.paper_bot import PaperBot
-from core import (
-    HybridInternalEquationMiner,
-    HybridSignalPresetConfig,
-    ShazamEntryOnlyEngine,
-    EntryOnlyConfig,
-)
+from live.paper_bot import PaperBot, DEFAULT_LADDER
+from core import HybridInternalEquationMiner, HybridSignalPresetConfig
 from core.supertrend import compute_supertrend
 
 
-# Engine selection
 ENGINE_V41_STABLE = "v41_stable"
 ENGINE_ENTRY_ONLY = "entry_only"
+DISPLAY_MODE_SINGLE = "single"    # show only active engine's markers
+DISPLAY_MODE_COMPARE = "compare"  # both engines emit signals; chart shows nothing
 
 
 class LiveEngineManager:
-    """Orchestrates live data + engines + paper trading."""
-    
     def __init__(
         self,
         symbol: str = "BTCUSDT",
         timeframe: str = "5m",
-        warmup_bars: int = 500,  # smaller than lab — for faster live start
+        warmup_bars: int = 500,
         preset: str = "balanced",
     ):
         self.symbol = symbol.upper()
@@ -48,60 +37,67 @@ class LiveEngineManager:
         self.warmup_bars = warmup_bars
         self.preset = preset
         
-        # State
-        self.candles: List[Dict[str, Any]] = []  # buffer of closed candles
-        self.current_tick: Optional[Dict[str, Any]] = None  # latest live candle (not closed)
+        self.candles: List[Dict[str, Any]] = []
+        self.current_tick: Optional[Dict[str, Any]] = None
         self.dna: Optional[pd.DataFrame] = None
+        self.dna_snapshot: Optional[pd.DataFrame] = None  # saved at warmup for reports
         self.mining_ready = False
         self.mining_in_progress = False
         
-        # Active engine (only one runs at a time)
-        self.active_engine: str = ENGINE_V41_STABLE  # default
+        # Active engine (Single mode) or both (Compare mode)
+        self.active_engine: str = ENGINE_V41_STABLE
+        self.display_mode: str = DISPLAY_MODE_SINGLE
         
-        # Engines (we keep instances; only the active one runs)
+        # Chart display toggles
+        self.show_markers: bool = True  # BUY/SELL/EXIT markers on chart
+        
         self.preset_cfg = HybridSignalPresetConfig.from_name(preset)
         self.miner = HybridInternalEquationMiner(top_k=self.preset_cfg.top_k)
         
-        # Signals & trades
-        self.signals: List[Dict[str, Any]] = []  # recent signals (any engine)
-        self.last_signal_per_side = {"BUY": None, "SELL": None}  # for dedup in entry_only
+        # Signals (all signals from both engines, tagged)
+        self.signals: List[Dict[str, Any]] = []
+        # Per-engine dedup state
+        self.last_signal_per_side = {
+            ENGINE_V41_STABLE: {"BUY": None, "SELL": None},
+            ENGINE_ENTRY_ONLY: {"BUY": None, "SELL": None},
+        }
         
-        # Paper bots — one per engine
+        # Paper bots (one per engine)
         self.paper_v41 = PaperBot(initial_balance=10000.0, engine_name="v4.1 Stable")
         self.paper_entry_only = PaperBot(initial_balance=10000.0, engine_name="Entry-Only")
         
-        # Entry-Only TP/SL settings (user-adjustable from UI)
+        # Entry-Only settings
         self.entry_only_settings = {
+            "exit_mode": "ladder",  # "ladder" | "manual" | "disabled"
+            "use_ladder": True,
+            "ladder": [list(p) for p in DEFAULT_LADDER],  # [[trigger, lock], ...]
             "buy_tp_pct": 0.10,
             "buy_sl_pct": 1.50,
             "sell_tp_pct": 0.05,
             "sell_sl_pct": 0.75,
             "max_hold_bars": 144,
-            "enabled": True,  # user can pause exits
+            "enabled": True,
         }
         
-        # SuperTrend settings
+        # SuperTrend
         self.supertrend_settings = {
-            "period": 10,
-            "multiplier": 3.0,
-            "offset_pct": 0.0,
-            "thickness": 2,
+            "period": 10, "multiplier": 3.0,
+            "offset_pct": 0.0, "thickness": 2,
         }
         
-        # WebSocket client
         self.ws_client: Optional[BinanceWSClient] = None
         self._running = False
         self._lock = threading.Lock()
+        self.started_at_ms: Optional[int] = None
     
     # ---------- Lifecycle ----------
     
     def start(self):
-        """Start: load historical, then connect WS."""
         if self._running:
             return {"status": "already_running"}
         self._running = True
+        self.started_at_ms = int(time.time() * 1000)
         
-        # 1. Fetch historical (warmup + extra for indicator)
         n_to_fetch = max(self.warmup_bars + 100, 600)
         print(f"📊 Fetching {n_to_fetch} historical candles for {self.symbol} {self.timeframe}...")
         try:
@@ -112,21 +108,17 @@ class LiveEngineManager:
             return {"status": "error", "error": str(e)}
         
         with self._lock:
-            self.candles = hist[:-1]  # exclude the unclosed current candle
+            self.candles = hist[:-1]
             if hist:
                 self.current_tick = hist[-1]
         
         print(f"✓ Loaded {len(self.candles)} closed candles")
         
-        # 2. Build initial DNA + start mining in background
         threading.Thread(target=self._initial_setup, daemon=True).start()
         
-        # 3. Start WebSocket
         self.ws_client = BinanceWSClient(
-            symbol=self.symbol,
-            interval=self.timeframe,
-            on_tick=self._on_tick,
-            on_closed=self._on_closed,
+            symbol=self.symbol, interval=self.timeframe,
+            on_tick=self._on_tick, on_closed=self._on_closed,
         )
         self.ws_client.start()
         print(f"📡 WebSocket started for {self.symbol}@{self.timeframe}")
@@ -140,15 +132,12 @@ class LiveEngineManager:
         return {"status": "stopped"}
     
     def _initial_setup(self):
-        """Build DNA + run mining (one-time, on warmup)."""
         self.mining_in_progress = True
         try:
             with self._lock:
                 candles_copy = list(self.candles)
-            
-            if len(candles_copy) < self.warmup_bars:
-                print(f"⚠ Not enough candles ({len(candles_copy)} < {self.warmup_bars})")
-                self.mining_in_progress = False
+            if len(candles_copy) < min(self.warmup_bars, 200):
+                print(f"⚠ Not enough candles ({len(candles_copy)})")
                 return
             
             print(f"🔨 Building DNA from {len(candles_copy)} candles...")
@@ -156,49 +145,42 @@ class LiveEngineManager:
             dna = build_dna_from_candles(candles_copy)
             print(f"  DNA built in {time.time()-t0:.1f}s (cols={len(dna.columns)})")
             
-            print(f"⛏ Mining (Multi-Window) — this takes ~30-60s one-time...")
+            print(f"⛏ Mining (Multi-Window) — ~30-60s one-time...")
             t0 = time.time()
             self.miner.prepare(dna, horizon=24, win_threshold_pct=0.10)
             print(f"  Mining done in {time.time()-t0:.1f}s ({len(self.miner.mined_rules)} rules)")
             
             with self._lock:
                 self.dna = dna
+                self.dna_snapshot = dna.copy()  # snapshot for reports
                 self.mining_ready = True
-            
             print(f"✅ Engine ready. Scanning new candles for signals...")
         except Exception as e:
             print(f"❌ Mining error: {e}")
-            import traceback
-            traceback.print_exc()
+            import traceback; traceback.print_exc()
         finally:
             self.mining_in_progress = False
     
     # ---------- Event handlers ----------
     
     def _on_tick(self, candle: Dict[str, Any]):
-        """Live tick (not closed) — just update current_tick + paper bots' current price."""
         self.current_tick = candle
-        # Update paper bots' floating PnL
         with self._lock:
             self.paper_v41.update_current_price(float(candle["close"]), int(candle["open_time"]))
             self.paper_entry_only.update_current_price(float(candle["close"]), int(candle["open_time"]))
     
     def _on_closed(self, candle: Dict[str, Any]):
-        """A candle closed → append to buffer + rebuild DNA + scan signals."""
         with self._lock:
-            # Avoid duplicates
             if self.candles and self.candles[-1]["open_time"] == candle["open_time"]:
                 self.candles[-1] = candle
             else:
                 self.candles.append(candle)
-                # Keep buffer reasonable
                 if len(self.candles) > 5000:
                     self.candles = self.candles[-5000:]
         
         if not self.mining_ready:
-            return  # still warming up
+            return
         
-        # Rebuild DNA + scan
         try:
             with self._lock:
                 candles_copy = list(self.candles)
@@ -210,7 +192,6 @@ class LiveEngineManager:
             print(f"⚠ scan error: {e}")
     
     def _scan_signal_at_latest_bar(self, closed_candle: Dict[str, Any]):
-        """Run active engine on the latest closed bar — emit signal if any."""
         if self.dna is None or not self.mining_ready:
             return
         
@@ -221,11 +202,9 @@ class LiveEngineManager:
         dna_window = self.dna.iloc[max(0, i - self.warmup_bars + 1): i + 1]
         empty_expert_row = pd.Series(dtype=object)
         active = self.miner.active_rules(i, dna_window, empty_expert_row, top_k=99)
-        
         if not active:
             return
         
-        # Group by side
         by_side = {"BUY": [], "SELL": []}
         for r in active:
             if r.side in by_side:
@@ -234,96 +213,102 @@ class LiveEngineManager:
         price = float(closed_candle["close"])
         ts = int(closed_candle["open_time"])
         
-        for side, rules in by_side.items():
-            if not rules:
-                continue
-            
-            # Selection: differ by active engine
-            if self.active_engine == ENGINE_V41_STABLE:
-                # Quality-based (top by WR + score)
-                top = max(rules, key=lambda r: (
-                    r.rule_wr * 0.55 - r.rule_loss_rate * 3.0 + (2 if r.rule_clause_count >= 2 else 0)
-                ))
-            else:  # entry_only
-                # Progressive First-Hit
-                rules_with_w = [(self._extract_window(r), r) for r in rules]
-                rules_with_w.sort(key=lambda x: (x[0], -float(getattr(x[1], "rule_wr", 0.0))))
-                top = None
-                fallback = None
-                for w, r in rules_with_w:
-                    wr = float(getattr(r, "rule_wr", 0.0))
-                    if wr >= 98.0:
-                        top = r
-                        break
-                    if fallback is None or wr > float(getattr(fallback, "rule_wr", 0.0)):
-                        fallback = r
+        # In Compare mode: both engines emit signals. In Single: only active engine.
+        engines_to_run = [ENGINE_V41_STABLE, ENGINE_ENTRY_ONLY] if self.display_mode == DISPLAY_MODE_COMPARE else [self.active_engine]
+        
+        for engine_name in engines_to_run:
+            for side, rules in by_side.items():
+                if not rules:
+                    continue
+                
+                # Selection (different per engine)
+                if engine_name == ENGINE_V41_STABLE:
+                    top = max(rules, key=lambda r: (
+                        r.rule_wr * 0.55 - r.rule_loss_rate * 3.0 + (2 if r.rule_clause_count >= 2 else 0)
+                    ))
+                else:  # entry_only — Progressive First-Hit
+                    rules_with_w = [(self._extract_window(r), r) for r in rules]
+                    rules_with_w.sort(key=lambda x: (x[0], -float(getattr(x[1], "rule_wr", 0.0))))
+                    top = None
+                    fallback = None
+                    for w, r in rules_with_w:
+                        wr = float(getattr(r, "rule_wr", 0.0))
+                        if wr >= 98.0:
+                            top = r; break
+                        if fallback is None or wr > float(getattr(fallback, "rule_wr", 0.0)):
+                            fallback = r
+                    if top is None:
+                        top = fallback
                 if top is None:
-                    top = fallback
-            
-            if top is None:
-                continue
-            
-            # Build signal
-            wr = float(getattr(top, "rule_wr", 0.0))
-            window = self._extract_window(top)
-            confidence = self._confidence_tier(wr, int(getattr(top, "rule_signals", 0)))
-            
-            signal = {
-                "timestamp_ms": ts,
-                "time": ts // 1000,  # seconds for chart
-                "side": side,
-                "price": price,
-                "rule_window": window,
-                "rule_wr": wr,
-                "rule_formula": str(getattr(top, "formula", "")),
-                "confidence": confidence,
-                "engine": self.active_engine,
-            }
-            
-            # Entry-Only dedup: same rule = bridge, skip
-            if self.active_engine == ENGINE_ENTRY_ONLY:
-                last = self.last_signal_per_side.get(side)
-                if last and last["rule_formula"] == signal["rule_formula"]:
-                    continue  # bridge, skip
-                self.last_signal_per_side[side] = signal
-            
-            # Reset opposite side last
-            opposite = "SELL" if side == "BUY" else "BUY"
-            if self.last_signal_per_side.get(opposite):
-                self.last_signal_per_side[opposite] = None
-            
-            with self._lock:
-                self.signals.append(signal)
-                if len(self.signals) > 500:
-                    self.signals = self.signals[-500:]
-            
-            # Feed to active paper bot
-            self._feed_signal_to_bot(signal)
+                    continue
+                
+                wr = float(getattr(top, "rule_wr", 0.0))
+                window = self._extract_window(top)
+                confidence = self._confidence_tier(wr, int(getattr(top, "rule_signals", 0)))
+                
+                signal = {
+                    "timestamp_ms": ts,
+                    "time": ts // 1000,
+                    "side": side,
+                    "price": price,
+                    "rule_window": window,
+                    "rule_wr": wr,
+                    "rule_loss_rate": float(getattr(top, "rule_loss_rate", 0.0)),
+                    "rule_signals_in_window": int(getattr(top, "rule_signals", 0)),
+                    "rule_formula": str(getattr(top, "formula", "")),
+                    "rule_family": str(getattr(top, "rule_family", "?")),
+                    "confidence": confidence,
+                    "engine": engine_name,
+                }
+                
+                # Entry-Only dedup (per engine)
+                if engine_name == ENGINE_ENTRY_ONLY:
+                    last = self.last_signal_per_side[engine_name].get(side)
+                    if last and last["rule_formula"] == signal["rule_formula"]:
+                        continue
+                    self.last_signal_per_side[engine_name][side] = signal
+                    opposite = "SELL" if side == "BUY" else "BUY"
+                    if self.last_signal_per_side[engine_name].get(opposite):
+                        self.last_signal_per_side[engine_name][opposite] = None
+                
+                with self._lock:
+                    self.signals.append(signal)
+                    if len(self.signals) > 2000:
+                        self.signals = self.signals[-2000:]
+                
+                # Record signal in the engine's bot (for reporting)
+                if engine_name == ENGINE_V41_STABLE:
+                    self.paper_v41.record_signal(signal)
+                else:
+                    self.paper_entry_only.record_signal(signal)
+                
+                # Feed to bot for execution
+                self._feed_signal_to_bot(signal, engine_name)
     
-    def _feed_signal_to_bot(self, signal: Dict[str, Any]):
-        """Feed signal to the active engine's paper bot."""
-        if self.active_engine == ENGINE_V41_STABLE:
-            # v4.1 stable: open trade with locked exit (asymmetric)
+    def _feed_signal_to_bot(self, signal: Dict[str, Any], engine_name: str):
+        if engine_name == ENGINE_V41_STABLE:
             tp = 0.10 if signal["side"] == "BUY" else 0.05
             sl = 1.50 if signal["side"] == "BUY" else 0.75
             tp_hard = 3.00 if signal["side"] == "BUY" else 1.50
             self.paper_v41.handle_signal(
                 signal, tp_pct=tp, sl_pct=sl, tp_hard_pct=tp_hard,
                 trail_giveback=0.05 if signal["side"] == "BUY" else 0.03,
-                max_hold_bars=144,
-                use_trail=True,
+                max_hold_bars=144, use_trail=True,
             )
         else:
-            # Entry-Only: use user-adjustable settings
             s = self.entry_only_settings
             if not s.get("enabled", True):
                 return
+            mode = s.get("exit_mode", "ladder")
             tp = s["buy_tp_pct"] if signal["side"] == "BUY" else s["sell_tp_pct"]
             sl = s["buy_sl_pct"] if signal["side"] == "BUY" else s["sell_sl_pct"]
+            ladder = [tuple(x) for x in s.get("ladder", DEFAULT_LADDER)]
             self.paper_entry_only.handle_signal(
                 signal, tp_pct=tp, sl_pct=sl,
                 max_hold_bars=int(s["max_hold_bars"]),
-                use_trail=False,  # entry-only: fixed TP/SL
+                use_trail=False,
+                use_ladder=(mode == "ladder"),
+                ladder=ladder,
             )
     
     def _extract_window(self, rule) -> int:
@@ -336,10 +321,8 @@ class LiveEngineManager:
         return 0
     
     def _confidence_tier(self, wr: float, sigs: int) -> str:
-        if wr >= 95 and sigs >= 10:
-            return "HIGH"
-        if wr >= 92 and sigs >= 7:
-            return "MEDIUM"
+        if wr >= 95 and sigs >= 10: return "HIGH"
+        if wr >= 92 and sigs >= 7: return "MEDIUM"
         return "LOW"
     
     # ---------- Public API ----------
@@ -349,13 +332,27 @@ class LiveEngineManager:
             return {"ok": False, "error": "unknown engine"}
         with self._lock:
             self.active_engine = engine_name
-            # Reset dedup state on switch
-            self.last_signal_per_side = {"BUY": None, "SELL": None}
+            for e in self.last_signal_per_side:
+                self.last_signal_per_side[e] = {"BUY": None, "SELL": None}
         return {"ok": True, "active_engine": engine_name}
+    
+    def set_display_mode(self, mode: str) -> Dict[str, Any]:
+        if mode not in (DISPLAY_MODE_SINGLE, DISPLAY_MODE_COMPARE):
+            return {"ok": False, "error": "unknown mode"}
+        with self._lock:
+            self.display_mode = mode
+        return {"ok": True, "display_mode": mode}
+    
+    def set_show_markers(self, show: bool) -> Dict[str, Any]:
+        with self._lock:
+            self.show_markers = bool(show)
+        return {"ok": True, "show_markers": self.show_markers}
     
     def update_entry_only_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
-            for k in ("buy_tp_pct", "buy_sl_pct", "sell_tp_pct", "sell_sl_pct", "max_hold_bars", "enabled"):
+            allowed = ("buy_tp_pct", "buy_sl_pct", "sell_tp_pct", "sell_sl_pct",
+                       "max_hold_bars", "enabled", "exit_mode", "use_ladder", "ladder")
+            for k in allowed:
                 if k in settings:
                     self.entry_only_settings[k] = settings[k]
         return {"ok": True, "settings": self.entry_only_settings}
@@ -383,6 +380,8 @@ class LiveEngineManager:
                 "symbol": self.symbol,
                 "timeframe": self.timeframe,
                 "active_engine": self.active_engine,
+                "display_mode": self.display_mode,
+                "show_markers": self.show_markers,
                 "mining_ready": self.mining_ready,
                 "mining_in_progress": self.mining_in_progress,
                 "candles_loaded": len(self.candles),
@@ -397,70 +396,40 @@ class LiveEngineManager:
             }
     
     def get_chart_data(self, n: int = 200) -> Dict[str, Any]:
-        """Return candles + supertrend + signals for chart rendering."""
         with self._lock:
             candles = list(self.candles[-n:])
             current = self.current_tick
+            show_markers = self.show_markers
         
-        candles_out = []
-        for c in candles:
-            candles_out.append({
-                "time": c["open_time"] // 1000,
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-                "volume": c["volume"],
-            })
-        if current and (not candles_out or current["open_time"] // 1000 > candles_out[-1]["time"]):
-            candles_out.append({
-                "time": current["open_time"] // 1000,
-                "open": current["open"],
-                "high": current["high"],
-                "low": current["low"],
-                "close": current["close"],
-                "volume": current["volume"],
-            })
+        candles_out = [{"time": c["open_time"]//1000, "open": c["open"], "high": c["high"],
+                        "low": c["low"], "close": c["close"], "volume": c["volume"]} for c in candles]
+        if current and (not candles_out or current["open_time"]//1000 > candles_out[-1]["time"]):
+            candles_out.append({"time": current["open_time"]//1000, "open": current["open"],
+                                "high": current["high"], "low": current["low"],
+                                "close": current["close"], "volume": current["volume"]})
         
-        # SuperTrend
         st = self.supertrend_settings
         all_candles_for_st = candles + ([current] if current else [])
-        supertrend = compute_supertrend(
-            all_candles_for_st,
-            period=int(st["period"]),
-            multiplier=float(st["multiplier"]),
-            offset_pct=float(st["offset_pct"]),
-        )
-        # only the last N for the chart
-        supertrend = supertrend[-n:]
+        supertrend = compute_supertrend(all_candles_for_st,
+            period=int(st["period"]), multiplier=float(st["multiplier"]),
+            offset_pct=float(st["offset_pct"]))[-n:]
         
-        # Signals (only from active engine, last N candles range)
-        if candles_out:
-            min_time = candles_out[0]["time"]
-        else:
-            min_time = 0
+        min_time = candles_out[0]["time"] if candles_out else 0
+        
+        # Signals to show on chart (only if show_markers AND display_mode==single)
         with self._lock:
-            recent_signals = [
-                {
-                    "time": s["time"],
-                    "side": s["side"],
-                    "price": s["price"],
-                    "confidence": s["confidence"],
-                    "rule_window": s["rule_window"],
-                    "rule_wr": s["rule_wr"],
-                    "engine": s["engine"],
-                }
-                for s in self.signals
-                if s["time"] >= min_time and s["engine"] == self.active_engine
-            ]
+            if not show_markers or self.display_mode == DISPLAY_MODE_COMPARE:
+                recent_signals = []
+                trade_markers = []
+            else:
+                recent_signals = [s for s in self.signals
+                                  if s["time"] >= min_time and s["engine"] == self.active_engine]
+                active_bot = self.paper_v41 if self.active_engine == ENGINE_V41_STABLE else self.paper_entry_only
+                trade_markers = active_bot.get_chart_markers(min_time=min_time)
         
-        # Trade markers from active engine's paper bot
-        active_bot = self.paper_v41 if self.active_engine == ENGINE_V41_STABLE else self.paper_entry_only
-        trade_markers = active_bot.get_chart_markers(min_time=min_time)
-        
-        # Active TP line (for entry-only with open position)
+        # TP/SL line only in single mode + entry-only + open position + markers shown
         tp_line = None
-        if self.active_engine == ENGINE_ENTRY_ONLY:
+        if show_markers and self.display_mode == DISPLAY_MODE_SINGLE and self.active_engine == ENGINE_ENTRY_ONLY:
             open_pos = self.paper_entry_only.get_open_position()
             if open_pos:
                 tp_line = {
@@ -479,7 +448,6 @@ class LiveEngineManager:
         }
     
     def get_paper_stats(self) -> Dict[str, Any]:
-        """Get stats for both paper bots."""
         return {
             "v41_stable": self.paper_v41.get_stats(),
             "entry_only": self.paper_entry_only.get_stats(),
@@ -495,10 +463,162 @@ class LiveEngineManager:
         return {"ok": True}
     
     def close_position_manual(self, engine_name: str) -> Dict[str, Any]:
-        """User can manually close the open position (Entry-Only mainly)."""
         bot = self.paper_v41 if engine_name == ENGINE_V41_STABLE else self.paper_entry_only
         price = float(self.current_tick["close"]) if self.current_tick else None
         ts = int(self.current_tick["open_time"]) if self.current_tick else int(time.time()*1000)
         if price is None:
             return {"ok": False, "error": "no current price"}
         return bot.close_open_position(price, ts, reason="MANUAL")
+    
+    # ---------- Reports ----------
+    
+    def generate_report(self, engine_name: str) -> bytes:
+        """Generate a full report ZIP for the engine.
+        
+        Contains:
+          - signals.csv (all signals captured by this engine)
+          - trades.csv (executed trades + outcomes)
+          - equations_report.csv (per-equation aggregated stats)
+          - summary.json (overall metrics)
+          - live_dna_snapshot.csv (DNA at warmup, for auditing)
+        """
+        bot = self.paper_v41 if engine_name == ENGINE_V41_STABLE else self.paper_entry_only
+        report = bot.get_report_data()
+        
+        signals_df = pd.DataFrame(report["signals"])
+        trades_df = pd.DataFrame(report["trades"])
+        
+        # Equations report (aggregated by formula+side)
+        equations_data = []
+        if len(signals_df) > 0:
+            for (formula, side), grp in signals_df.groupby(["rule_formula", "side"]):
+                # Try to find trades that came from this formula
+                if len(trades_df) > 0:
+                    matching_trades = trades_df[(trades_df["rule_formula"] == formula) & (trades_df["side"] == side)]
+                else:
+                    matching_trades = pd.DataFrame()
+                
+                eq = {
+                    "rule_formula": formula,
+                    "side": side,
+                    "rule_window": int(grp["rule_window"].iloc[0]) if "rule_window" in grp else 0,
+                    "rule_family": grp["rule_family"].iloc[0] if "rule_family" in grp else "?",
+                    "mining_signals": int(grp["rule_signals_in_window"].iloc[0]) if "rule_signals_in_window" in grp else 0,
+                    "mining_wr": float(grp["rule_wr"].iloc[0]) if "rule_wr" in grp else 0.0,
+                    "mining_loss_rate": float(grp["rule_loss_rate"].iloc[0]) if "rule_loss_rate" in grp else 0.0,
+                    "signals_emitted_live": int(len(grp)),
+                    "trades_executed": int(len(matching_trades)),
+                    "trade_wins": int((matching_trades["result"] == "WIN").sum()) if len(matching_trades) > 0 else 0,
+                    "trade_losses": int((matching_trades["result"] == "LOSS").sum()) if len(matching_trades) > 0 else 0,
+                    "trade_avg_pnl_pct": float(matching_trades["pnl_pct"].mean()) if len(matching_trades) > 0 else 0.0,
+                    "trade_total_pnl_pct": float(matching_trades["pnl_pct"].sum()) if len(matching_trades) > 0 else 0.0,
+                    "confidence": grp["confidence"].iloc[0] if "confidence" in grp else "LOW",
+                }
+                # Estimate mining wins/losses
+                eq["mining_wins"] = int(round(eq["mining_wr"]/100.0 * eq["mining_signals"]))
+                eq["mining_losses"] = int(round(eq["mining_loss_rate"]/100.0 * eq["mining_signals"]))
+                equations_data.append(eq)
+        equations_df = pd.DataFrame(equations_data)
+        if len(equations_df) > 0:
+            equations_df = equations_df.sort_values(["side", "signals_emitted_live"], ascending=[True, False])
+        
+        # Summary
+        stats = report["stats"]
+        summary = {
+            "engine_name": stats["engine_name"],
+            "report_generated_at": datetime.utcnow().isoformat() + "Z",
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "warmup_bars": self.warmup_bars,
+            "candles_loaded_at_start": len(self.candles),
+            "mining_audit": self.miner.audit[0] if self.miner.audit else {},
+            "started_at_ms": self.started_at_ms,
+            "current_time_ms": int(time.time() * 1000),
+            "uptime_minutes": ((int(time.time()*1000) - (self.started_at_ms or int(time.time()*1000))) / 60000),
+            "settings": {
+                "entry_only": self.entry_only_settings if engine_name == ENGINE_ENTRY_ONLY else None,
+                "supertrend": self.supertrend_settings,
+            },
+            "performance": stats,
+            "signals_breakdown": {
+                "total": len(signals_df),
+                "buy": int((signals_df["side"] == "BUY").sum()) if len(signals_df) > 0 else 0,
+                "sell": int((signals_df["side"] == "SELL").sum()) if len(signals_df) > 0 else 0,
+                "high_confidence": int((signals_df["confidence"] == "HIGH").sum()) if len(signals_df) > 0 else 0,
+                "medium_confidence": int((signals_df["confidence"] == "MEDIUM").sum()) if len(signals_df) > 0 else 0,
+                "low_confidence": int((signals_df["confidence"] == "LOW").sum()) if len(signals_df) > 0 else 0,
+            },
+            "trades_breakdown": {
+                "total": len(trades_df),
+                "wins": stats["wins"],
+                "losses": stats["losses"],
+                "neutrals": stats["neutrals"],
+                "win_rate_pct": stats["win_rate_pct"],
+                "exit_reasons": (
+                    {k: int(v) for k, v in trades_df["reason"].value_counts().to_dict().items()}
+                    if len(trades_df) > 0 else {}
+                ),
+                "best_trade_pct": float(trades_df["pnl_pct"].max()) if len(trades_df) > 0 else 0.0,
+                "worst_trade_pct": float(trades_df["pnl_pct"].min()) if len(trades_df) > 0 else 0.0,
+            },
+            "unique_equations": {
+                "buy": int(((equations_df["side"] == "BUY")).sum()) if len(equations_df) > 0 else 0,
+                "sell": int(((equations_df["side"] == "SELL")).sum()) if len(equations_df) > 0 else 0,
+            },
+        }
+        
+        # Build ZIP
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            if len(signals_df) > 0:
+                zf.writestr("signals.csv", signals_df.to_csv(index=False))
+            if len(trades_df) > 0:
+                zf.writestr("trades.csv", trades_df.to_csv(index=False))
+            if len(equations_df) > 0:
+                zf.writestr("equations_report.csv", equations_df.to_csv(index=False))
+            zf.writestr("summary.json", json.dumps(summary, indent=2, default=str))
+            
+            # DNA snapshot (for auditing)
+            with self._lock:
+                snap = self.dna_snapshot
+            if snap is not None and len(snap) > 0:
+                # Keep only source + raw DNA columns to avoid huge file (32 cols vs 4099)
+                raw_cols = [c for c in snap.columns if c.startswith("source_") or c.startswith("candle_")
+                           or c in ("timestamp", "demand_pressure_score", "supply_pressure_score",
+                                    "demand_supply_delta", "volume_taker_buy_ratio_pct", "abs_return_pct")]
+                snap_lite = snap[raw_cols] if raw_cols else snap.iloc[:, :30]
+                zf.writestr("live_dna_snapshot.csv", snap_lite.to_csv(index=False))
+            
+            zf.writestr("README.md", _REPORT_README.format(engine=stats["engine_name"]))
+        
+        return buf.getvalue()
+
+
+_REPORT_README = """# Shazam Live Report — {engine}
+
+## Files
+
+- **signals.csv**: every signal emitted by this engine (with rule details)
+- **trades.csv**: actual paper trades (entry/exit/PnL/reason)
+- **equations_report.csv**: aggregated per-equation stats (mining + live performance)
+- **summary.json**: overall metrics, settings, mining audit
+- **live_dna_snapshot.csv**: raw DNA at warmup (for auditing — first 30 columns)
+
+## How to read
+
+- `mining_*` columns: from training (window-based historical analysis)
+- `signals_emitted_live`: signals this equation produced in this live session
+- `trades_executed`: trades the paper bot actually opened from these signals
+- `trade_*`: actual outcomes (wins/losses/avg_pnl)
+
+## Exit reasons
+
+- `LADDER_LOCK`: Step Ladder protection triggered (Entry-Only)
+- `TRAIL_LOCK`: micro-trail closed (v4.1)
+- `TAKE_PROFIT`: fixed TP hit
+- `TP_HARD`: hard ceiling reached
+- `STOP_LOSS`: SL hit
+- `MAX_HOLD`: max hold bars reached
+- `REVERSE`: closed because opposite signal arrived
+- `MANUAL`: user closed manually
+"""
