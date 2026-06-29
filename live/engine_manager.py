@@ -49,7 +49,9 @@ class LiveEngineManager:
         self.display_mode: str = DISPLAY_MODE_SINGLE
         
         # Chart display toggles
-        self.show_markers: bool = True  # BUY/SELL/EXIT markers on chart
+        self.show_signals: bool = True  # BUY/SELL arrows on chart
+        self.show_trades: bool = True   # entry/exit trade markers on chart
+        self.show_tp_sl: bool = True    # TP/SL horizontal lines on chart
         
         self.preset_cfg = HybridSignalPresetConfig.from_name(preset)
         self.miner = HybridInternalEquationMiner(top_k=self.preset_cfg.top_k)
@@ -343,10 +345,22 @@ class LiveEngineManager:
             self.display_mode = mode
         return {"ok": True, "display_mode": mode}
     
-    def set_show_markers(self, show: bool) -> Dict[str, Any]:
+    def set_show_toggles(self, show_signals: Optional[bool] = None,
+                          show_trades: Optional[bool] = None,
+                          show_tp_sl: Optional[bool] = None) -> Dict[str, Any]:
         with self._lock:
-            self.show_markers = bool(show)
-        return {"ok": True, "show_markers": self.show_markers}
+            if show_signals is not None:
+                self.show_signals = bool(show_signals)
+            if show_trades is not None:
+                self.show_trades = bool(show_trades)
+            if show_tp_sl is not None:
+                self.show_tp_sl = bool(show_tp_sl)
+        return {
+            "ok": True,
+            "show_signals": self.show_signals,
+            "show_trades": self.show_trades,
+            "show_tp_sl": self.show_tp_sl,
+        }
     
     def update_entry_only_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
@@ -381,7 +395,9 @@ class LiveEngineManager:
                 "timeframe": self.timeframe,
                 "active_engine": self.active_engine,
                 "display_mode": self.display_mode,
-                "show_markers": self.show_markers,
+                "show_signals": self.show_signals,
+                "show_trades": self.show_trades,
+                "show_tp_sl": self.show_tp_sl,
                 "mining_ready": self.mining_ready,
                 "mining_in_progress": self.mining_in_progress,
                 "candles_loaded": len(self.candles),
@@ -399,7 +415,6 @@ class LiveEngineManager:
         with self._lock:
             candles = list(self.candles[-n:])
             current = self.current_tick
-            show_markers = self.show_markers
         
         candles_out = [{"time": c["open_time"]//1000, "open": c["open"], "high": c["high"],
                         "low": c["low"], "close": c["close"], "volume": c["volume"]} for c in candles]
@@ -416,9 +431,10 @@ class LiveEngineManager:
         
         min_time = candles_out[0]["time"] if candles_out else 0
         
-        # Signals to show on chart (only if show_markers AND display_mode==single)
+        # Signals + trade markers — only for ACTIVE engine (or none in compare mode)
+        # Client-side toggles filter further
         with self._lock:
-            if not show_markers or self.display_mode == DISPLAY_MODE_COMPARE:
+            if self.display_mode == DISPLAY_MODE_COMPARE:
                 recent_signals = []
                 trade_markers = []
             else:
@@ -427,9 +443,9 @@ class LiveEngineManager:
                 active_bot = self.paper_v41 if self.active_engine == ENGINE_V41_STABLE else self.paper_entry_only
                 trade_markers = active_bot.get_chart_markers(min_time=min_time)
         
-        # TP/SL line only in single mode + entry-only + open position + markers shown
+        # TP/SL line: only for Entry-Only with open position in single mode
         tp_line = None
-        if show_markers and self.display_mode == DISPLAY_MODE_SINGLE and self.active_engine == ENGINE_ENTRY_ONLY:
+        if self.display_mode == DISPLAY_MODE_SINGLE and self.active_engine == ENGINE_ENTRY_ONLY:
             open_pos = self.paper_entry_only.get_open_position()
             if open_pos:
                 tp_line = {
