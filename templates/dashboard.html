@@ -41,9 +41,25 @@
             </select>
           </div>
           <div class="setting-group">
-            <label>إظهار الإشارات</label>
-            <select id="showMarkers" onchange="applyShowMarkers()">
-              <option value="true">نعم</option>
+            <label>إشارات BUY/SELL</label>
+            <select id="showSignals" onchange="applyShowToggles()">
+              <option value="true">إظهار</option>
+              <option value="false">إخفاء</option>
+            </select>
+          </div>
+        </div>
+        <div class="setting-row">
+          <div class="setting-group">
+            <label>علامات الصفقات (دخول/خروج)</label>
+            <select id="showTrades" onchange="applyShowToggles()">
+              <option value="true">إظهار</option>
+              <option value="false">إخفاء</option>
+            </select>
+          </div>
+          <div class="setting-group">
+            <label>خطوط TP / SL</label>
+            <select id="showTpSl" onchange="applyShowToggles()">
+              <option value="true">إظهار</option>
               <option value="false">إخفاء</option>
             </select>
           </div>
@@ -172,7 +188,7 @@
         <div class="stat"><div class="stat-label">الصفقات</div><div class="stat-value" id="v41_trades">0</div></div>
       </div>
       <div class="stats-row">
-        <div class="mini-stat"><span>الإشارات</span><b id="v41_signals">0</b></div>
+        <div class="mini-stat"><span>إشارات v4.1</span><b id="v41_signals">0</b></div>
         <div class="mini-stat win"><span>فاز</span><b id="v41_wins">0</b></div>
         <div class="mini-stat loss"><span>خسر</span><b id="v41_losses">0</b></div>
         <div class="mini-stat"><span>WR</span><b id="v41_wr">0%</b></div>
@@ -207,7 +223,7 @@
         <div class="stat"><div class="stat-label">الصفقات</div><div class="stat-value" id="eo_trades">0</div></div>
       </div>
       <div class="stats-row">
-        <div class="mini-stat"><span>الإشارات</span><b id="eo_signals">0</b></div>
+        <div class="mini-stat"><span>إشارات EO</span><b id="eo_signals">0</b></div>
         <div class="mini-stat win"><span>فاز</span><b id="eo_wins">0</b></div>
         <div class="mini-stat loss"><span>خسر</span><b id="eo_losses">0</b></div>
         <div class="mini-stat"><span>WR</span><b id="eo_wr">0%</b></div>
