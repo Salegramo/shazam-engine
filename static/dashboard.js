@@ -284,6 +284,8 @@ function syncEntryOnlySettings(s) {
   if ($("eo_buy_sl_global")) $("eo_buy_sl_global").value = s.buy_sl_pct || 1.50;
   if ($("eo_sell_sl_global")) $("eo_sell_sl_global").value = s.sell_sl_pct || 0.75;
   if ($("eo_max_hold")) $("eo_max_hold").value = s.max_hold_bars || 144;
+  if ($("eo_cooldown")) $("eo_cooldown").value = s.cooldown_bars !== undefined ? s.cooldown_bars : 6;
+  if ($("eo_smart_reverse")) $("eo_smart_reverse").value = String(s.smart_reverse !== false);
   if (s.ladder && s.ladder.length) {
     renderLadder(s.ladder);
   } else {
@@ -512,6 +514,8 @@ async function applyEntryOnlySettings() {
     buy_sl_pct: parseFloat($("eo_buy_sl_global").value),
     sell_sl_pct: parseFloat($("eo_sell_sl_global").value),
     max_hold_bars: parseInt($("eo_max_hold").value),
+    cooldown_bars: parseInt($("eo_cooldown").value),
+    smart_reverse: $("eo_smart_reverse").value === "true",
   };
   
   if (exitMode === "manual") {
