@@ -4,14 +4,15 @@
 
 let chart = null;
 let candleSeries = null;
-let supertrendLineUp = null;
-let supertrendLineDown = null;
+let supertrendSegments = [];  // array of line series, recreated on every update
 let tpLineSeries = null;
 let slLineSeries = null;
 
 let currentEngine = "v41_stable";
 let currentDisplayMode = "single";
-let currentShowMarkers = true;
+let currentShowSignals = true;
+let currentShowTrades = true;
+let currentShowTpSl = true;
 let stThickness = 2;
 
 const DEFAULT_LADDER = [
@@ -44,6 +45,10 @@ function toggleSettings() {
   $("settingsPanel").classList.toggle("hidden");
 }
 
+function closeSettings() {
+  $("settingsPanel").classList.add("hidden");
+}
+
 // ----------- Chart Setup -----------
 function initChart() {
   const container = $("chart");
@@ -60,14 +65,7 @@ function initChart() {
     borderUpColor: "#00ff88", borderDownColor: "#ff4d4d",
     wickUpColor: "#00ff88", wickDownColor: "#ff4d4d",
   });
-  supertrendLineUp = chart.addLineSeries({
-    color: "#00ff88", lineWidth: 2, lineStyle: 0,
-    crosshairMarkerVisible: false, lastValueVisible: false, priceLineVisible: false,
-  });
-  supertrendLineDown = chart.addLineSeries({
-    color: "#ff4d4d", lineWidth: 2, lineStyle: 0,
-    crosshairMarkerVisible: false, lastValueVisible: false, priceLineVisible: false,
-  });
+  // SuperTrend handled as dynamic segments (see updateSupertrend below)
   tpLineSeries = chart.addLineSeries({
     color: "#38bdf8", lineWidth: 1, lineStyle: 2,
     crosshairMarkerVisible: false, lastValueVisible: true, priceLineVisible: false, title: "TP"
@@ -79,58 +77,95 @@ function initChart() {
   window.addEventListener("resize", () => chart.applyOptions({ width: container.clientWidth }));
 }
 
+
+// ----------- SuperTrend (single line, multi-color segments) -----------
+function updateSupertrend(points) {
+  // Clear old segments
+  for (const s of supertrendSegments) {
+    try { chart.removeSeries(s); } catch(e) {}
+  }
+  supertrendSegments = [];
+  if (!points || points.length === 0) return;
+  
+  // Build segments: a new segment starts on every direction change.
+  // CRITICAL: the transition point is included in BOTH the old and new segment,
+  // so the line is visually continuous (no gap), just color changes there.
+  const segments = [];
+  let curDir = points[0].direction;
+  let curSeg = [points[0]];
+  for (let i = 1; i < points.length; i++) {
+    const pt = points[i];
+    if (pt.direction === curDir) {
+      curSeg.push(pt);
+    } else {
+      // Direction change — include the transition point in old seg, then start new from it
+      curSeg.push(pt);  // close old segment at transition
+      segments.push({ direction: curDir, points: curSeg });
+      curSeg = [pt];    // new segment starts AT the transition point
+      curDir = pt.direction;
+    }
+  }
+  segments.push({ direction: curDir, points: curSeg });
+  
+  // Create a line series for each segment
+  for (const seg of segments) {
+    if (seg.points.length < 2) continue;  // skip 1-point segments
+    const color = seg.direction === "bull" ? "#00ff88" : "#ff4d4d";
+    const series = chart.addLineSeries({
+      color: color,
+      lineWidth: stThickness,
+      lineStyle: 0,
+      crosshairMarkerVisible: false,
+      lastValueVisible: false,
+      priceLineVisible: false,
+    });
+    series.setData(seg.points.map(p => ({ time: p.time, value: p.value })));
+    supertrendSegments.push(series);
+  }
+}
+
 // ----------- Chart Update -----------
 function updateChart(data) {
   if (!data || !data.candles) return;
   candleSeries.setData(data.candles);
   
-  // SuperTrend
-  supertrendLineUp.applyOptions({ lineWidth: stThickness });
-  supertrendLineDown.applyOptions({ lineWidth: stThickness });
-  const upSeries = [];
-  const downSeries = [];
-  for (const pt of data.supertrend || []) {
-    if (pt.direction === "bull") {
-      upSeries.push({ time: pt.time, value: pt.value });
-      downSeries.push({ time: pt.time });
-    } else {
-      downSeries.push({ time: pt.time, value: pt.value });
-      upSeries.push({ time: pt.time });
+  // SuperTrend — single continuous line, color changes at trend transitions
+  updateSupertrend(data.supertrend || []);
+  
+  // Markers — filtered by show toggles
+  const markers = [];
+  if (currentShowSignals) {
+    for (const s of data.signals || []) {
+      markers.push({
+        time: s.time, position: s.side === "BUY" ? "belowBar" : "aboveBar",
+        color: s.side === "BUY" ? "#00ff88" : "#ff4d4d",
+        shape: s.side === "BUY" ? "arrowUp" : "arrowDown", text: s.side,
+      });
     }
   }
-  supertrendLineUp.setData(upSeries);
-  supertrendLineDown.setData(downSeries);
-  
-  // Markers
-  const markers = [];
-  for (const s of data.signals || []) {
-    markers.push({
-      time: s.time, position: s.side === "BUY" ? "belowBar" : "aboveBar",
-      color: s.side === "BUY" ? "#00ff88" : "#ff4d4d",
-      shape: s.side === "BUY" ? "arrowUp" : "arrowDown", text: s.side,
-    });
-  }
-  for (const m of data.trade_markers || []) {
-    if (m.type === "entry") {
-      markers.push({
-        time: m.time, position: m.side === "BUY" ? "belowBar" : "aboveBar",
-        color: m.side === "BUY" ? "#34d399" : "#fb7185",
-        shape: m.side === "BUY" ? "arrowUp" : "arrowDown",
-        text: m.side + (m.open ? "●" : ""),
-      });
-    } else if (m.type === "exit") {
-      markers.push({
-        time: m.time, position: "inBar",
-        color: m.pnl_pct >= 0 ? "#39c5cf" : "#fb7185",
-        shape: "circle", text: "EXIT",
-      });
+  if (currentShowTrades) {
+    for (const m of data.trade_markers || []) {
+      if (m.type === "entry") {
+        markers.push({
+          time: m.time, position: m.side === "BUY" ? "belowBar" : "aboveBar",
+          color: m.side === "BUY" ? "#34d399" : "#fb7185",
+          shape: m.side === "BUY" ? "arrowUp" : "arrowDown",
+          text: m.side + (m.open ? "●" : ""),
+        });
+      } else if (m.type === "exit") {
+        markers.push({
+          time: m.time, position: "inBar",
+          color: m.pnl_pct >= 0 ? "#39c5cf" : "#fb7185",
+          shape: "circle", text: "EXIT",
+        });
+      }
     }
   }
   markers.sort((a, b) => a.time - b.time);
   candleSeries.setMarkers(markers);
   
-  // TP/SL lines
-  if (data.tp_line) {
+  // TP/SL lines (filtered by toggle)
+  if (data.tp_line && currentShowTpSl) {
     const tp = data.tp_line;
     const lastTime = data.candles[data.candles.length - 1].time;
     const startTime = tp.entry_time;
@@ -216,9 +251,17 @@ async function updateStatus() {
       currentDisplayMode = data.display_mode;
       if ($("displayMode")) $("displayMode").value = data.display_mode;
     }
-    if (data.show_markers !== currentShowMarkers) {
-      currentShowMarkers = data.show_markers;
-      if ($("showMarkers")) $("showMarkers").value = String(data.show_markers);
+    if (data.show_signals !== undefined && data.show_signals !== currentShowSignals) {
+      currentShowSignals = data.show_signals;
+      if ($("showSignals")) $("showSignals").value = String(data.show_signals);
+    }
+    if (data.show_trades !== undefined && data.show_trades !== currentShowTrades) {
+      currentShowTrades = data.show_trades;
+      if ($("showTrades")) $("showTrades").value = String(data.show_trades);
+    }
+    if (data.show_tp_sl !== undefined && data.show_tp_sl !== currentShowTpSl) {
+      currentShowTpSl = data.show_tp_sl;
+      if ($("showTpSl")) $("showTpSl").value = String(data.show_tp_sl);
     }
     
     // Sync entry-only settings if user hasn't been editing
@@ -355,15 +398,19 @@ async function applyDisplayMode() {
   } catch (e) { console.error(e); }
 }
 
-async function applyShowMarkers() {
-  const show = $("showMarkers").value === "true";
-  currentShowMarkers = show;
+async function applyShowToggles() {
+  currentShowSignals = $("showSignals").value === "true";
+  currentShowTrades = $("showTrades").value === "true";
+  currentShowTpSl = $("showTpSl").value === "true";
   try {
     await fetch("/api/show-markers", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ show }),
+      body: JSON.stringify({
+        show_signals: currentShowSignals,
+        show_trades: currentShowTrades,
+        show_tp_sl: currentShowTpSl,
+      }),
     });
-    showToast(show ? "تم إظهار الإشارات" : "تم إخفاء الإشارات");
     await tickChart();
   } catch (e) { console.error(e); }
 }
@@ -383,6 +430,7 @@ async function applySupertrendSettings() {
       body: JSON.stringify(body),
     });
     showToast("تم تطبيق SuperTrend");
+    closeSettings();
     await tickChart();
   } catch (e) { console.error(e); }
 }
@@ -488,6 +536,7 @@ async function applyEntryOnlySettings() {
       body: JSON.stringify(body),
     });
     showToast("✓ تم تطبيق الإعدادات");
+    closeSettings();
   } catch (e) { console.error(e); showToast("خطأ في التطبيق"); }
 }
 
