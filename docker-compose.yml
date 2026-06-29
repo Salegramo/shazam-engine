@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  shazam-live:
+    build: .
+    container_name: shazam-live
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - SHAZAM_SYMBOL=BTCUSDT
+      - SHAZAM_TIMEFRAME=5m
+      - SHAZAM_WARMUP=500
+      - PYTHONUNBUFFERED=1
