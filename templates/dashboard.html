@@ -314,7 +314,23 @@
                 <label>Max Hold (شموع)</label>
                 <input type="number" id="eo_max_hold" value="144" min="10" max="500">
               </div>
-              <div class="setting-group"><label>&nbsp;</label><span class="hint" style="padding:8px 0">SL يعمل دائماً كحماية</span></div>
+              <div class="setting-group">
+                <label>Cooldown بعد الإغلاق (شموع)</label>
+                <input type="number" id="eo_cooldown" value="6" min="0" max="50">
+              </div>
+            </div>
+            <div class="setting-row">
+              <div class="setting-group">
+                <label>إغلاق ذكي عند العكس</label>
+                <select id="eo_smart_reverse">
+                  <option value="true" selected>نعم (فقط إذا الصفقة رابحة)</option>
+                  <option value="false">لا (إغلاق دائماً)</option>
+                </select>
+              </div>
+              <div class="setting-group">
+                <label>&nbsp;</label>
+                <span class="hint" style="padding:8px 0">يمنع REVERSE في الخسارة</span>
+              </div>
             </div>
             
             <button class="apply-btn" onclick="applyEntryOnlySettings()">💾 تطبيق الإعدادات</button>
