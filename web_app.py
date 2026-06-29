@@ -1,10 +1,4 @@
-"""Shazam Live v1 — Main FastAPI app.
-
-Serves:
-- / → dashboard.html
-- /api/* → live trading APIs
-- /static/* → CSS/JS
-"""
+"""Shazam Live v1 — Main FastAPI app (FIXED: router registered before app starts)."""
 from __future__ import annotations
 import os
 from pathlib import Path
@@ -21,49 +15,41 @@ from api import register_live_api
 
 ROOT_DIR = Path(__file__).resolve().parent
 
-manager: LiveEngineManager = None
+# Build manager early (no Binance connection yet)
+SYMBOL = os.getenv("SHAZAM_SYMBOL", "BTCUSDT")
+TIMEFRAME = os.getenv("SHAZAM_TIMEFRAME", "5m")
+WARMUP = int(os.getenv("SHAZAM_WARMUP", "500"))
+
+print(f"🚀 Shazam Live v1 — building manager (no connection yet)")
+print(f"   symbol: {SYMBOL}, timeframe: {TIMEFRAME}, warmup: {WARMUP}")
+
+manager = LiveEngineManager(symbol=SYMBOL, timeframe=TIMEFRAME, warmup_bars=WARMUP)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global manager
-    symbol = os.getenv("SHAZAM_SYMBOL", "BTCUSDT")
-    timeframe = os.getenv("SHAZAM_TIMEFRAME", "5m")
-    warmup = int(os.getenv("SHAZAM_WARMUP", "500"))
-    
-    print(f"🚀 Initializing Shazam Live v1")
-    print(f"   symbol: {symbol}, timeframe: {timeframe}, warmup: {warmup}")
-    
     try:
-        manager = LiveEngineManager(
-            symbol=symbol,
-            timeframe=timeframe,
-            warmup_bars=warmup,
-        )
-        register_live_api(app, manager)
         manager.start()
-        print(f"✓ Manager started")
+        print(f"✓ Manager started (connecting to Binance)")
     except Exception as e:
         print(f"❌ Startup error: {e}")
         import traceback; traceback.print_exc()
-    
     yield
-    
     print(f"🛑 Shutting down")
-    if manager:
-        manager.stop()
+    manager.stop()
 
 
 app = FastAPI(title="Shazam Live", lifespan=lifespan)
 
-# CORS (open for now)
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
+
+# Register API routes BEFORE app starts (this is the fix for the 404s)
+register_live_api(app, manager)
 
 # Static files
 app.mount("/static", StaticFiles(directory=str(ROOT_DIR / "static")), name="static")
@@ -76,6 +62,4 @@ def root():
 
 @app.get("/health")
 def health():
-    if manager is None:
-        return JSONResponse({"status": "starting"}, status_code=503)
     return {"status": "ok"}
