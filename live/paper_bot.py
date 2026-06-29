@@ -34,34 +34,46 @@ LADDER_OVERFLOW_RATIO = 0.72
 
 
 def compute_lock_from_ladder(peak_pnl_pct: float, ladder: List[Tuple[float, float]]) -> Optional[float]:
-    """Given current peak_pnl%, return the locked-profit% (or None if peak hasn't reached first trigger).
+    """Linear interpolation lock from peak.
     
     Behavior:
-        peak < ladder[0].trigger: no lock
-        peak between two triggers: lock = the LOWER trigger's lock
-        peak >= max trigger: lock = peak * overflow_ratio
+        peak < ladder[0].trigger: no lock (SL protects)
+        peak between two triggers: linear interpolation between locks
+        peak >= max trigger: lock = peak * overflow_ratio (~72%)
+    
+    Example with default ladder:
+        Peak=0.10 → Lock=0.060 (exactly at trigger 1)
+        Peak=0.14 → Lock=0.085 (interpolated: 50% between 0.10→0.18)
+        Peak=0.18 → Lock=0.110 (exactly at trigger 2)
+        Peak=0.50 → Lock=~0.34 (interpolated)
+        Peak=1.50 → Lock=1.08 (overflow: 1.50*0.72)
     """
     if not ladder:
         return None
     sorted_ladder = sorted(ladder, key=lambda x: x[0])
     
-    # Below first trigger
+    # Below first trigger → no lock
     if peak_pnl_pct < sorted_ladder[0][0]:
         return None
     
-    # Above max trigger
+    # Above max trigger → overflow ratio
     max_trigger, _ = sorted_ladder[-1]
     if peak_pnl_pct >= max_trigger:
         return peak_pnl_pct * LADDER_OVERFLOW_RATIO
     
-    # Find the highest trigger <= peak
-    current_lock = sorted_ladder[0][1]
-    for trig, lock in sorted_ladder:
-        if peak_pnl_pct >= trig:
-            current_lock = lock
-        else:
-            break
-    return current_lock
+    # Find the two surrounding triggers and interpolate
+    for i in range(len(sorted_ladder) - 1):
+        lo_trig, lo_lock = sorted_ladder[i]
+        hi_trig, hi_lock = sorted_ladder[i + 1]
+        if lo_trig <= peak_pnl_pct < hi_trig:
+            # Linear interpolation
+            if hi_trig == lo_trig:
+                return lo_lock
+            ratio = (peak_pnl_pct - lo_trig) / (hi_trig - lo_trig)
+            return lo_lock + ratio * (hi_lock - lo_lock)
+    
+    # Shouldn't reach here, but fallback to highest lock
+    return sorted_ladder[-1][1]
 
 
 class PaperBot:
@@ -124,25 +136,59 @@ class PaperBot:
         use_trail: bool = False,
         ladder: Optional[List[Tuple[float, float]]] = None,
         use_ladder: bool = False,
+        cooldown_bars: int = 0,
+        smart_reverse: bool = True,
     ):
         """Process a new entry signal.
         
-        If open position with OPPOSITE side: close first then open new.
-        If same side: ignore (bridge).
+        Behavior:
+          - same side + open position: BRIDGE (ignore)
+          - opposite side + open position:
+              * if position is currently profitable AND smart_reverse: close+reverse
+              * if position is currently in loss: IGNORE (let SL/ladder/trail handle exit)
+          - cooldown_bars: after a position closes, ignore new entries for N bars
         
         Args:
             use_trail: v4.1 micro-trail exit
             use_ladder: Step Ladder protection (Entry-Only)
+            cooldown_bars: bars to wait after close before new entry
+            smart_reverse: only reverse on opposite signal if currently profitable
         """
         with self._lock:
             side = signal["side"]
             entry_price = float(signal["price"])
             entry_time = int(signal["timestamp_ms"])
             
+            # ── Cooldown check (skip if too soon after last close) ──
+            if cooldown_bars > 0 and self.trades:
+                last_exit_time_ms = self.trades[-1]["exit_time"] * 1000
+                bars_since_close = (entry_time - last_exit_time_ms) // (5 * 60 * 1000)
+                if bars_since_close < cooldown_bars:
+                    return  # still cooling down
+            
             if self.open_position is not None:
                 if self.open_position["side"] == side:
-                    return  # bridge
-                self._close_position(entry_price, entry_time, reason="REVERSE")
+                    return  # bridge - same side, ignore
+                
+                # ── Smart REVERSE handling ──
+                if smart_reverse:
+                    # Check if current position is profitable
+                    cur_price = entry_price  # the new signal price = current market
+                    p = self.open_position
+                    if p["side"] == "BUY":
+                        cur_pnl = (cur_price - p["entry_price"]) / p["entry_price"] * 100
+                    else:
+                        cur_pnl = (p["entry_price"] - cur_price) / p["entry_price"] * 100
+                    
+                    # Only close+reverse if currently in profit
+                    if cur_pnl > 0:
+                        self._close_position(entry_price, entry_time, reason="REVERSE_PROFIT")
+                    else:
+                        # Position in loss → don't reverse, let SL/ladder/trail handle it
+                        return
+                else:
+                    # Old behavior: always reverse on opposite signal
+                    self._close_position(entry_price, entry_time, reason="REVERSE")
             
             if side == "BUY":
                 tp_price = entry_price * (1 + tp_pct / 100.0)

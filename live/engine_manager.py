@@ -72,13 +72,15 @@ class LiveEngineManager:
         self.entry_only_settings = {
             "exit_mode": "ladder",  # "ladder" | "manual" | "disabled"
             "use_ladder": True,
-            "ladder": [list(p) for p in DEFAULT_LADDER],  # [[trigger, lock], ...]
+            "ladder": [list(p) for p in DEFAULT_LADDER],
             "buy_tp_pct": 0.10,
             "buy_sl_pct": 1.50,
             "sell_tp_pct": 0.05,
             "sell_sl_pct": 0.75,
             "max_hold_bars": 144,
             "enabled": True,
+            "cooldown_bars": 6,       # bars to wait after close
+            "smart_reverse": True,     # only reverse on opposite signal if profitable
         }
         
         # SuperTrend
@@ -296,6 +298,8 @@ class LiveEngineManager:
                 signal, tp_pct=tp, sl_pct=sl, tp_hard_pct=tp_hard,
                 trail_giveback=0.05 if signal["side"] == "BUY" else 0.03,
                 max_hold_bars=144, use_trail=True,
+                cooldown_bars=12,        # v4.1 needs cooldown like the lab
+                smart_reverse=True,       # only reverse if profitable
             )
         else:
             s = self.entry_only_settings
@@ -311,6 +315,8 @@ class LiveEngineManager:
                 use_trail=False,
                 use_ladder=(mode == "ladder"),
                 ladder=ladder,
+                cooldown_bars=int(s.get("cooldown_bars", 6)),  # configurable
+                smart_reverse=bool(s.get("smart_reverse", True)),
             )
     
     def _extract_window(self, rule) -> int:
@@ -365,7 +371,8 @@ class LiveEngineManager:
     def update_entry_only_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
             allowed = ("buy_tp_pct", "buy_sl_pct", "sell_tp_pct", "sell_sl_pct",
-                       "max_hold_bars", "enabled", "exit_mode", "use_ladder", "ladder")
+                       "max_hold_bars", "enabled", "exit_mode", "use_ladder", "ladder",
+                       "cooldown_bars", "smart_reverse")
             for k in allowed:
                 if k in settings:
                     self.entry_only_settings[k] = settings[k]
@@ -594,16 +601,29 @@ class LiveEngineManager:
                 zf.writestr("equations_report.csv", equations_df.to_csv(index=False))
             zf.writestr("summary.json", json.dumps(summary, indent=2, default=str))
             
-            # DNA snapshot (for auditing)
+            # DNA snapshot (for auditing) — full raw DNA matching the lab
             with self._lock:
                 snap = self.dna_snapshot
             if snap is not None and len(snap) > 0:
-                # Keep only source + raw DNA columns to avoid huge file (32 cols vs 4099)
-                raw_cols = [c for c in snap.columns if c.startswith("source_") or c.startswith("candle_")
-                           or c in ("timestamp", "demand_pressure_score", "supply_pressure_score",
-                                    "demand_supply_delta", "volume_taker_buy_ratio_pct", "abs_return_pct")]
-                snap_lite = snap[raw_cols] if raw_cols else snap.iloc[:, :30]
-                zf.writestr("live_dna_snapshot.csv", snap_lite.to_csv(index=False))
+                # All 32 raw DNA columns (matches expanded_safe_live_dna.csv from the lab)
+                raw_cols = [
+                    "timestamp", "source_open", "source_high", "source_low", "source_close",
+                    "source_volume", "source_quote_volume", "source_trades",
+                    "source_taker_buy_base", "source_taker_buy_quote",
+                    "candle_return_pct", "candle_range_pct", "candle_body_pct", "candle_body_abs_pct",
+                    "candle_upper_wick_ratio_pct", "candle_lower_wick_ratio_pct",
+                    "candle_close_position_pct", "candle_direction_num",
+                    "volume_taker_buy_ratio_pct", "volume_taker_sell_ratio_pct",
+                    "demand_supply_delta", "demand_pressure_score", "supply_pressure_score",
+                    "effort_volume_range_ratio", "effort_quote_volume_range_ratio",
+                    "trades_per_volume", "abs_return_pct", "signed_body_to_range_pct",
+                    "upper_minus_lower_wick_pct", "quote_per_trade", "base_volume_per_trade",
+                    "taker_quote_ratio_pct",
+                ]
+                # Filter to only columns that actually exist
+                present_cols = [c for c in raw_cols if c in snap.columns]
+                snap_full = snap[present_cols] if present_cols else snap.iloc[:, :30]
+                zf.writestr("live_dna_snapshot.csv", snap_full.to_csv(index=False))
             
             zf.writestr("README.md", _REPORT_README.format(engine=stats["engine_name"]))
         
