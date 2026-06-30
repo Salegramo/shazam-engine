@@ -64,6 +64,19 @@
             </select>
           </div>
         </div>
+        <div class="setting-row">
+          <div class="setting-group">
+            <label>الدعم والمقاومة</label>
+            <select id="showSR" onchange="applyShowToggles()">
+              <option value="false" selected>إخفاء</option>
+              <option value="true">إظهار</option>
+            </select>
+          </div>
+          <div class="setting-group">
+            <label>&nbsp;</label>
+            <span class="hint" style="padding:8px 0">يُحسب من آخر 200 شمعة</span>
+          </div>
+        </div>
         <div class="hint" id="modeHint">
           🔹 وضع واحد: المحرك المختار يظهر على الشارت<br>
           🔸 مقارنة: كلا المحركين يعملان، الإشارات لا تظهر بالشارت — للمقارنة فقط
@@ -262,14 +275,25 @@
               </div>
             </div>
             
-            <!-- Step Ladder Editor -->
+            <!-- Step Ladder Editor (BUY + SELL separate) -->
             <div id="ladderSection">
-              <div class="ladder-title">جدول الحماية المتدرج (Trigger% → Lock%)</div>
-              <div id="ladderRows"></div>
-              <button class="apply-btn" style="background:var(--surface);border:1px solid var(--border)" onclick="resetLadderDefault()">↺ افتراضي</button>
+              <!-- BUY Ladder -->
+              <div class="ladder-title">📈 جدول BUY (Trigger% → Lock%)</div>
+              <div id="buyLadderRows"></div>
+              <div class="hint" style="margin-bottom:10px">
+                ladder للـBUY: giveback أصغر = ربح أكبر (moves أبطأ)
+              </div>
+              
+              <!-- SELL Ladder -->
+              <div class="ladder-title">📉 جدول SELL (Trigger% → Lock%)</div>
+              <div id="sellLadderRows"></div>
+              <div class="hint" style="margin-bottom:10px">
+                ladder للـSELL أضيق (moves أسرع، نأخذ الربح بسرعة)
+              </div>
+              
+              <button class="apply-btn" style="background:var(--surface);border:1px solid var(--border)" onclick="resetLadderDefault()">↺ افتراضي للاثنين</button>
               <div class="hint">
-                عند بلوغ الـTrigger، يثبت ربح Lock. لو السعر طاح وكسر الـLock → خروج.<br>
-                فوق آخر مستوى: Lock = Peak × 72%
+                عند بلوغ الـTrigger، يثبت ربح Lock. فوق آخر مستوى: Peak × overflow ratio
               </div>
             </div>
             
@@ -282,7 +306,7 @@
                 </div>
                 <div class="setting-group">
                   <label>BUY SL (%)</label>
-                  <input type="number" id="eo_buy_sl" value="1.50" step="0.05" min="0.1">
+                  <input type="number" id="eo_buy_sl" value="0.40" step="0.05" min="0.1">
                 </div>
               </div>
               <div class="setting-row">
@@ -292,9 +316,25 @@
                 </div>
                 <div class="setting-group">
                   <label>SELL SL (%)</label>
-                  <input type="number" id="eo_sell_sl" value="0.75" step="0.05" min="0.1">
+                  <input type="number" id="eo_sell_sl" value="0.30" step="0.05" min="0.1">
                 </div>
               </div>
+            </div>
+            
+            <!-- Time-based Stops -->
+            <div class="settings-divider">⏱ خروج زمني (Time Stops)</div>
+            <div class="setting-row">
+              <div class="setting-group">
+                <label>خروج بعد عدم تقدم (شموع)</label>
+                <input type="number" id="eo_time_no_profit" value="8" min="0" max="100">
+              </div>
+              <div class="setting-group">
+                <label>خروج بعد خسارة (شموع)</label>
+                <input type="number" id="eo_time_loss" value="15" min="0" max="100">
+              </div>
+            </div>
+            <div class="hint">
+              0 = تعطيل. الـtime-stop يمنع الـtrade من الوصول للـSL الكامل
             </div>
             
             <!-- Always-visible SL (safety net) and max hold -->
@@ -302,11 +342,11 @@
             <div class="setting-row">
               <div class="setting-group">
                 <label>BUY SL (%)</label>
-                <input type="number" id="eo_buy_sl_global" value="1.50" step="0.05" min="0.1">
+                <input type="number" id="eo_buy_sl_global" value="0.40" step="0.05" min="0.1">
               </div>
               <div class="setting-group">
                 <label>SELL SL (%)</label>
-                <input type="number" id="eo_sell_sl_global" value="0.75" step="0.05" min="0.1">
+                <input type="number" id="eo_sell_sl_global" value="0.30" step="0.05" min="0.1">
               </div>
             </div>
             <div class="setting-row">
