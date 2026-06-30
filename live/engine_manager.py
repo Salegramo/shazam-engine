@@ -13,7 +13,7 @@ import numpy as np
 
 from live.binance_provider import fetch_klines_rest, BinanceWSClient
 from live.dna_builder_live import build_dna_from_candles
-from live.paper_bot import PaperBot, DEFAULT_LADDER
+from live.paper_bot import PaperBot, DEFAULT_BUY_LADDER, DEFAULT_SELL_LADDER, BUY_OVERFLOW_RATIO, SELL_OVERFLOW_RATIO
 from core import HybridInternalEquationMiner, HybridSignalPresetConfig
 from core.supertrend import compute_supertrend
 
@@ -22,6 +22,79 @@ ENGINE_V41_STABLE = "v41_stable"
 ENGINE_ENTRY_ONLY = "entry_only"
 DISPLAY_MODE_SINGLE = "single"    # show only active engine's markers
 DISPLAY_MODE_COMPARE = "compare"  # both engines emit signals; chart shows nothing
+
+
+
+
+def compute_support_resistance(candles, lookback=200, n_levels=4, window=10):
+    """Compute support and resistance levels from pivot points.
+    
+    Algorithm:
+        1. Find local pivots (high/low) in last `lookback` candles
+        2. Cluster nearby pivots (within 0.5% of each other)
+        3. Return top N strongest clusters per side
+    
+    Returns:
+        {"resistance": [{"price": float, "strength": int}, ...],
+         "support":    [{"price": float, "strength": int}, ...]}
+    """
+    if not candles or len(candles) < window * 2 + 1:
+        return {"resistance": [], "support": []}
+    
+    use = candles[-lookback:] if len(candles) > lookback else candles
+    
+    # Find pivots
+    pivot_highs = []
+    pivot_lows = []
+    for i in range(window, len(use) - window):
+        h = float(use[i]["high"])
+        l = float(use[i]["low"])
+        is_high = all(h >= float(use[i-j]["high"]) for j in range(1, window+1)) and \
+                  all(h >= float(use[i+j]["high"]) for j in range(1, window+1))
+        is_low = all(l <= float(use[i-j]["low"]) for j in range(1, window+1)) and \
+                 all(l <= float(use[i+j]["low"]) for j in range(1, window+1))
+        if is_high: pivot_highs.append(h)
+        if is_low: pivot_lows.append(l)
+    
+    current_price = float(use[-1]["close"])
+    cluster_tol_pct = 0.3  # cluster within 0.3% of each other
+    
+    def cluster_pivots(pivots):
+        """Cluster nearby pivots; return list of {price, count}."""
+        if not pivots:
+            return []
+        sorted_p = sorted(pivots)
+        clusters = []
+        current_cluster = [sorted_p[0]]
+        for p in sorted_p[1:]:
+            if (p - current_cluster[-1]) / current_cluster[-1] * 100 <= cluster_tol_pct:
+                current_cluster.append(p)
+            else:
+                clusters.append({
+                    "price": sum(current_cluster) / len(current_cluster),
+                    "strength": len(current_cluster),
+                })
+                current_cluster = [p]
+        clusters.append({
+            "price": sum(current_cluster) / len(current_cluster),
+            "strength": len(current_cluster),
+        })
+        return clusters
+    
+    high_clusters = cluster_pivots(pivot_highs)
+    low_clusters = cluster_pivots(pivot_lows)
+    
+    # Resistance: clusters above current price; sort by strength desc, then by proximity
+    resistance = [c for c in high_clusters if c["price"] > current_price]
+    resistance.sort(key=lambda c: (-c["strength"], abs(c["price"] - current_price)))
+    resistance = resistance[:n_levels]
+    
+    # Support: clusters below current price
+    support = [c for c in low_clusters if c["price"] < current_price]
+    support.sort(key=lambda c: (-c["strength"], abs(c["price"] - current_price)))
+    support = support[:n_levels]
+    
+    return {"resistance": resistance, "support": support}
 
 
 class LiveEngineManager:
@@ -50,6 +123,7 @@ class LiveEngineManager:
         
         # Chart display toggles
         self.show_signals: bool = True  # BUY/SELL arrows on chart
+        self.show_sr: bool = False     # Support/Resistance lines
         self.show_trades: bool = True   # entry/exit trade markers on chart
         self.show_tp_sl: bool = True    # TP/SL horizontal lines on chart
         
@@ -70,17 +144,22 @@ class LiveEngineManager:
         
         # Entry-Only settings
         self.entry_only_settings = {
-            "exit_mode": "ladder",  # "ladder" | "manual" | "disabled"
+            "exit_mode": "ladder",
             "use_ladder": True,
-            "ladder": [list(p) for p in DEFAULT_LADDER],
+            "buy_ladder": [list(p) for p in DEFAULT_BUY_LADDER],
+            "sell_ladder": [list(p) for p in DEFAULT_SELL_LADDER],
+            "buy_overflow_ratio": BUY_OVERFLOW_RATIO,
+            "sell_overflow_ratio": SELL_OVERFLOW_RATIO,
             "buy_tp_pct": 0.10,
-            "buy_sl_pct": 1.50,
+            "buy_sl_pct": 0.40,      # tighter SL (was 1.50)
             "sell_tp_pct": 0.05,
-            "sell_sl_pct": 0.75,
+            "sell_sl_pct": 0.30,     # tighter SL (was 0.75)
             "max_hold_bars": 144,
             "enabled": True,
-            "cooldown_bars": 6,       # bars to wait after close
-            "smart_reverse": True,     # only reverse on opposite signal if profitable
+            "cooldown_bars": 6,
+            "smart_reverse": True,
+            "exit_after_no_profit_bars": 8,   # time-stop: no progress
+            "exit_after_loss_bars": 15,        # time-stop: in loss
         }
         
         # SuperTrend
@@ -292,14 +371,16 @@ class LiveEngineManager:
     def _feed_signal_to_bot(self, signal: Dict[str, Any], engine_name: str):
         if engine_name == ENGINE_V41_STABLE:
             tp = 0.10 if signal["side"] == "BUY" else 0.05
-            sl = 1.50 if signal["side"] == "BUY" else 0.75
-            tp_hard = 3.00 if signal["side"] == "BUY" else 1.50
+            sl = 0.40 if signal["side"] == "BUY" else 0.30   # tighter SL
+            tp_hard = 1.50 if signal["side"] == "BUY" else 1.00
             self.paper_v41.handle_signal(
                 signal, tp_pct=tp, sl_pct=sl, tp_hard_pct=tp_hard,
                 trail_giveback=0.05 if signal["side"] == "BUY" else 0.03,
                 max_hold_bars=144, use_trail=True,
-                cooldown_bars=12,        # v4.1 needs cooldown like the lab
-                smart_reverse=True,       # only reverse if profitable
+                cooldown_bars=12,
+                smart_reverse=True,
+                exit_after_no_profit_bars=8,  # time-stop
+                exit_after_loss_bars=15,
             )
         else:
             s = self.entry_only_settings
@@ -308,15 +389,21 @@ class LiveEngineManager:
             mode = s.get("exit_mode", "ladder")
             tp = s["buy_tp_pct"] if signal["side"] == "BUY" else s["sell_tp_pct"]
             sl = s["buy_sl_pct"] if signal["side"] == "BUY" else s["sell_sl_pct"]
-            ladder = [tuple(x) for x in s.get("ladder", DEFAULT_LADDER)]
+            buy_ladder = [tuple(x) for x in s.get("buy_ladder", DEFAULT_BUY_LADDER)]
+            sell_ladder = [tuple(x) for x in s.get("sell_ladder", DEFAULT_SELL_LADDER)]
             self.paper_entry_only.handle_signal(
                 signal, tp_pct=tp, sl_pct=sl,
                 max_hold_bars=int(s["max_hold_bars"]),
                 use_trail=False,
                 use_ladder=(mode == "ladder"),
-                ladder=ladder,
-                cooldown_bars=int(s.get("cooldown_bars", 6)),  # configurable
+                buy_ladder=buy_ladder,
+                sell_ladder=sell_ladder,
+                buy_overflow=float(s.get("buy_overflow_ratio", BUY_OVERFLOW_RATIO)),
+                sell_overflow=float(s.get("sell_overflow_ratio", SELL_OVERFLOW_RATIO)),
+                cooldown_bars=int(s.get("cooldown_bars", 6)),
                 smart_reverse=bool(s.get("smart_reverse", True)),
+                exit_after_no_profit_bars=int(s.get("exit_after_no_profit_bars", 8)),
+                exit_after_loss_bars=int(s.get("exit_after_loss_bars", 15)),
             )
     
     def _extract_window(self, rule) -> int:
@@ -353,7 +440,8 @@ class LiveEngineManager:
     
     def set_show_toggles(self, show_signals: Optional[bool] = None,
                           show_trades: Optional[bool] = None,
-                          show_tp_sl: Optional[bool] = None) -> Dict[str, Any]:
+                          show_tp_sl: Optional[bool] = None,
+                          show_sr: Optional[bool] = None) -> Dict[str, Any]:
         with self._lock:
             if show_signals is not None:
                 self.show_signals = bool(show_signals)
@@ -361,18 +449,24 @@ class LiveEngineManager:
                 self.show_trades = bool(show_trades)
             if show_tp_sl is not None:
                 self.show_tp_sl = bool(show_tp_sl)
+            if show_sr is not None:
+                self.show_sr = bool(show_sr)
         return {
             "ok": True,
             "show_signals": self.show_signals,
             "show_trades": self.show_trades,
             "show_tp_sl": self.show_tp_sl,
+                "show_sr": self.show_sr,
+            "show_sr": self.show_sr,
         }
     
     def update_entry_only_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
             allowed = ("buy_tp_pct", "buy_sl_pct", "sell_tp_pct", "sell_sl_pct",
-                       "max_hold_bars", "enabled", "exit_mode", "use_ladder", "ladder",
-                       "cooldown_bars", "smart_reverse")
+                       "max_hold_bars", "enabled", "exit_mode", "use_ladder",
+                       "buy_ladder", "sell_ladder", "buy_overflow_ratio", "sell_overflow_ratio",
+                       "cooldown_bars", "smart_reverse",
+                       "exit_after_no_profit_bars", "exit_after_loss_bars")
             for k in allowed:
                 if k in settings:
                     self.entry_only_settings[k] = settings[k]
@@ -405,6 +499,7 @@ class LiveEngineManager:
                 "show_signals": self.show_signals,
                 "show_trades": self.show_trades,
                 "show_tp_sl": self.show_tp_sl,
+                "show_sr": self.show_sr,
                 "mining_ready": self.mining_ready,
                 "mining_in_progress": self.mining_in_progress,
                 "candles_loaded": len(self.candles),
@@ -462,12 +557,18 @@ class LiveEngineManager:
                     "side": open_pos["side"],
                 }
         
+        # Support/Resistance (only computed if toggle is on, to save CPU)
+        sr_data = {"resistance": [], "support": []}
+        if self.show_sr:
+            sr_data = compute_support_resistance(candles, lookback=200, n_levels=4, window=10)
+        
         return {
             "candles": candles_out,
             "supertrend": supertrend,
             "signals": recent_signals,
             "trade_markers": trade_markers,
             "tp_line": tp_line,
+            "sr": sr_data,
         }
     
     def get_paper_stats(self) -> Dict[str, Any]:
@@ -583,7 +684,11 @@ class LiveEngineManager:
                 ),
                 "best_trade_pct": float(trades_df["pnl_pct"].max()) if len(trades_df) > 0 else 0.0,
                 "worst_trade_pct": float(trades_df["pnl_pct"].min()) if len(trades_df) > 0 else 0.0,
+                "avg_win_pct": float(trades_df[trades_df["pnl_pct"] > 0]["pnl_pct"].mean()) if (trades_df["pnl_pct"] > 0).any() else 0.0,
+                "avg_loss_pct": float(trades_df[trades_df["pnl_pct"] < 0]["pnl_pct"].mean()) if (trades_df["pnl_pct"] < 0).any() else 0.0,
             },
+            "timing_analysis": _build_timing_analysis(trades_df),
+            "entry_position_breakdown": _build_entry_position_breakdown(trades_df),
             "unique_equations": {
                 "buy": int(((equations_df["side"] == "BUY")).sum()) if len(equations_df) > 0 else 0,
                 "sell": int(((equations_df["side"] == "SELL")).sum()) if len(equations_df) > 0 else 0,
@@ -630,31 +735,118 @@ class LiveEngineManager:
         return buf.getvalue()
 
 
+
+def _build_timing_analysis(trades_df):
+    """How fast did signals lead to profit / peak? Were they early or late?"""
+    if len(trades_df) == 0:
+        return {}
+    
+    # Filter to trades that reached first profit
+    with_first_profit = trades_df[trades_df["bars_to_first_profit"].notna()] if "bars_to_first_profit" in trades_df else trades_df.iloc[0:0]
+    with_peak = trades_df[(trades_df["bars_to_peak"].notna()) & (trades_df["peak_pnl_pct"] > 0.01)] if "bars_to_peak" in trades_df else trades_df.iloc[0:0]
+    
+    result = {
+        "trades_with_first_profit": int(len(with_first_profit)),
+        "trades_with_profit_peak": int(len(with_peak)),
+    }
+    if len(with_first_profit) > 0:
+        bars = with_first_profit["bars_to_first_profit"].astype(float)
+        result["bars_to_first_profit_avg"] = float(bars.mean())
+        result["bars_to_first_profit_median"] = float(bars.median())
+        result["bars_to_first_profit_min"] = int(bars.min())
+        result["bars_to_first_profit_max"] = int(bars.max())
+    if len(with_peak) > 0:
+        bars = with_peak["bars_to_peak"].astype(float)
+        result["bars_to_peak_avg"] = float(bars.mean())
+        result["bars_to_peak_median"] = float(bars.median())
+        result["bars_to_peak_min"] = int(bars.min())
+        result["bars_to_peak_max"] = int(bars.max())
+        if "giveback_pct_of_peak" in with_peak:
+            result["avg_giveback_pct_of_peak"] = float(with_peak["giveback_pct_of_peak"].mean())
+    return result
+
+
+def _build_entry_position_breakdown(trades_df):
+    """Classification: EARLY / MIDDLE / LATE entries.
+    
+    EARLY  = peak came late in trade (we caught most of move)
+    MIDDLE = peak in middle of trade
+    LATE   = peak came fast (we entered near top)
+    """
+    if len(trades_df) == 0 or "entry_timing" not in trades_df:
+        return {}
+    
+    counts = trades_df["entry_timing"].value_counts().to_dict()
+    total = len(trades_df)
+    result = {"total": total}
+    for tier in ("EARLY", "MIDDLE", "LATE", "UNKNOWN"):
+        n = int(counts.get(tier, 0))
+        result[tier.lower()] = {
+            "count": n,
+            "pct": round(n / total * 100, 1) if total > 0 else 0.0,
+        }
+    
+    # Performance per tier
+    perf = {}
+    for tier in ("EARLY", "MIDDLE", "LATE"):
+        subset = trades_df[trades_df["entry_timing"] == tier]
+        if len(subset) > 0:
+            wins = (subset["pnl_pct"] > 0).sum()
+            perf[tier.lower()] = {
+                "trades": int(len(subset)),
+                "wr": round(wins / len(subset) * 100, 1),
+                "avg_pnl": round(float(subset["pnl_pct"].mean()), 4),
+                "total_pnl": round(float(subset["pnl_pct"].sum()), 4),
+            }
+    result["performance_by_tier"] = perf
+    return result
+
+
 _REPORT_README = """# Shazam Live Report — {engine}
 
 ## Files
 
 - **signals.csv**: every signal emitted by this engine (with rule details)
-- **trades.csv**: actual paper trades (entry/exit/PnL/reason)
+- **trades.csv**: actual paper trades + timing metrics
 - **equations_report.csv**: aggregated per-equation stats (mining + live performance)
-- **summary.json**: overall metrics, settings, mining audit
-- **live_dna_snapshot.csv**: raw DNA at warmup (for auditing — first 30 columns)
+- **summary.json**: overall metrics, settings, timing analysis, entry position breakdown
+- **live_dna_snapshot.csv**: raw DNA at warmup (32 cols, matches lab)
 
-## How to read
+## Trades CSV — new columns
 
-- `mining_*` columns: from training (window-based historical analysis)
-- `signals_emitted_live`: signals this equation produced in this live session
-- `trades_executed`: trades the paper bot actually opened from these signals
-- `trade_*`: actual outcomes (wins/losses/avg_pnl)
+| Column                     | Meaning                                     |
+|----------------------------|---------------------------------------------|
+| bars_held                  | Total candles held                          |
+| bars_to_first_profit       | When pnl first crossed +0.05%               |
+| bars_to_peak               | When peak_pnl_pct was achieved              |
+| peak_pnl_pct               | Best PnL% during the trade                  |
+| giveback_at_exit_pct       | How much we gave back from peak (absolute)  |
+| giveback_pct_of_peak       | Giveback as % of peak (e.g. 15%)            |
+| entry_timing               | EARLY / MIDDLE / LATE (see below)           |
+
+## Entry Timing Classification
+
+Each trade is tagged based on WHERE the peak occurred within the trade:
+
+- **EARLY** = peak came in last 25% of trade → we caught most of the move ✓
+- **MIDDLE** = peak in middle 25-75% → average entry
+- **LATE** = peak in first 25% (came fast) → we entered near top ✗
+
+## Summary.json — key sections
+
+- `timing_analysis`: avg/median bars to first profit + peak
+- `entry_position_breakdown`: count + WR per timing tier
+- `performance_by_tier`: which tier wins more
 
 ## Exit reasons
 
-- `LADDER_LOCK`: Step Ladder protection triggered (Entry-Only)
+- `LADDER_LOCK`: Step Ladder protection triggered
 - `TRAIL_LOCK`: micro-trail closed (v4.1)
-- `TAKE_PROFIT`: fixed TP hit
-- `TP_HARD`: hard ceiling reached
-- `STOP_LOSS`: SL hit
-- `MAX_HOLD`: max hold bars reached
-- `REVERSE`: closed because opposite signal arrived
-- `MANUAL`: user closed manually
+- `TIME_STOP_NO_PROFIT`: 8 bars without reaching +0.05%
+- `TIME_STOP_LOSS`: 15 bars while in loss
+- `STOP_LOSS`: hit SL
+- `TP_HARD`: hard ceiling
+- `MAX_HOLD`: reached max bars
+- `REVERSE_PROFIT`: closed (profitable) on opposite signal
+- `MANUAL`: user closed
 """
