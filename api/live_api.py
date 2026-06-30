@@ -23,6 +23,7 @@ class ShowToggles(BaseModel):
     show_signals: Optional[bool] = None
     show_trades: Optional[bool] = None
     show_tp_sl: Optional[bool] = None
+    show_sr: Optional[bool] = None
 
 
 class EntryOnlySettings(BaseModel):
@@ -34,9 +35,14 @@ class EntryOnlySettings(BaseModel):
     enabled: Optional[bool] = None
     exit_mode: Optional[str] = None
     use_ladder: Optional[bool] = None
-    ladder: Optional[List[List[float]]] = None
+    buy_ladder: Optional[List[List[float]]] = None
+    sell_ladder: Optional[List[List[float]]] = None
+    buy_overflow_ratio: Optional[float] = None
+    sell_overflow_ratio: Optional[float] = None
     cooldown_bars: Optional[int] = None
     smart_reverse: Optional[bool] = None
+    exit_after_no_profit_bars: Optional[int] = None
+    exit_after_loss_bars: Optional[int] = None
 
 
 class SuperTrendSettings(BaseModel):
@@ -90,6 +96,7 @@ def register_live_api(app, manager) -> APIRouter:
             show_signals=body.show_signals,
             show_trades=body.show_trades,
             show_tp_sl=body.show_tp_sl,
+            show_sr=body.show_sr,
         )
     
     @router.post("/entry-only-settings")
