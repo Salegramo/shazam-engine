@@ -26,17 +26,14 @@ DISPLAY_MODE_COMPARE = "compare"  # both engines emit signals; chart shows nothi
 
 
 
-def compute_support_resistance(candles, lookback=200, n_levels=4, window=10):
+def compute_support_resistance(candles, lookback=300, n_levels=5, window=6):
     """Compute support and resistance levels from pivot points.
     
-    Algorithm:
-        1. Find local pivots (high/low) in last `lookback` candles
-        2. Cluster nearby pivots (within 0.5% of each other)
-        3. Return top N strongest clusters per side
-    
-    Returns:
-        {"resistance": [{"price": float, "strength": int}, ...],
-         "support":    [{"price": float, "strength": int}, ...]}
+    Improved version:
+        1. Smaller window=6 → captures more pivots in noisy markets
+        2. ATR-based clustering tolerance (adaptive to volatility)
+        3. Returns n_levels=5 per side
+        4. Falls back to weaker pivots if no strong clusters
     """
     if not candles or len(candles) < window * 2 + 1:
         return {"resistance": [], "support": []}
@@ -57,7 +54,16 @@ def compute_support_resistance(candles, lookback=200, n_levels=4, window=10):
         if is_low: pivot_lows.append(l)
     
     current_price = float(use[-1]["close"])
-    cluster_tol_pct = 0.3  # cluster within 0.3% of each other
+    
+    # ATR-based clustering tolerance (adaptive to volatility)
+    # Compute average true range over last 50 candles
+    recent = use[-50:] if len(use) >= 50 else use
+    ranges = []
+    for c in recent:
+        ranges.append(float(c["high"]) - float(c["low"]))
+    avg_range = sum(ranges) / max(1, len(ranges))
+    # Cluster tolerance: 1x ATR (smaller = more distinct levels)
+    cluster_tol_abs = max(avg_range * 1.0, current_price * 0.0008)  # min 0.08%
     
     def cluster_pivots(pivots):
         """Cluster nearby pivots; return list of {price, count}."""
@@ -67,7 +73,7 @@ def compute_support_resistance(candles, lookback=200, n_levels=4, window=10):
         clusters = []
         current_cluster = [sorted_p[0]]
         for p in sorted_p[1:]:
-            if (p - current_cluster[-1]) / current_cluster[-1] * 100 <= cluster_tol_pct:
+            if (p - current_cluster[-1]) <= cluster_tol_abs:
                 current_cluster.append(p)
             else:
                 clusters.append({
@@ -84,12 +90,12 @@ def compute_support_resistance(candles, lookback=200, n_levels=4, window=10):
     high_clusters = cluster_pivots(pivot_highs)
     low_clusters = cluster_pivots(pivot_lows)
     
-    # Resistance: clusters above current price; sort by strength desc, then by proximity
+    # Resistance: above current price; sort by strength desc, then proximity
     resistance = [c for c in high_clusters if c["price"] > current_price]
     resistance.sort(key=lambda c: (-c["strength"], abs(c["price"] - current_price)))
     resistance = resistance[:n_levels]
     
-    # Support: clusters below current price
+    # Support: below current price
     support = [c for c in low_clusters if c["price"] < current_price]
     support.sort(key=lambda c: (-c["strength"], abs(c["price"] - current_price)))
     support = support[:n_levels]
@@ -560,7 +566,7 @@ class LiveEngineManager:
         # Support/Resistance (only computed if toggle is on, to save CPU)
         sr_data = {"resistance": [], "support": []}
         if self.show_sr:
-            sr_data = compute_support_resistance(candles, lookback=200, n_levels=4, window=10)
+            sr_data = compute_support_resistance(candles, lookback=300, n_levels=5, window=6)
         
         return {
             "candles": candles_out,
