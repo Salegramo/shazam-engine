@@ -13,11 +13,16 @@ let currentDisplayMode = "single";
 let currentShowSignals = true;
 let currentShowTrades = true;
 let currentShowTpSl = true;
+let currentShowSR = false;
 let stThickness = 2;
 
-const DEFAULT_LADDER = [
-  [0.10, 0.06], [0.18, 0.11], [0.28, 0.18],
-  [0.40, 0.27], [0.55, 0.38], [0.75, 0.52], [1.00, 0.72],
+const DEFAULT_BUY_LADDER = [
+  [0.05, 0.040], [0.10, 0.085], [0.15, 0.130], [0.22, 0.195],
+  [0.32, 0.290], [0.50, 0.460], [0.75, 0.700], [1.00, 0.930],
+];
+const DEFAULT_SELL_LADDER = [
+  [0.05, 0.038], [0.10, 0.080], [0.15, 0.123], [0.22, 0.181],
+  [0.32, 0.265], [0.50, 0.415], [0.75, 0.625], [1.00, 0.850],
 ];
 
 // ----------- Helpers -----------
@@ -75,6 +80,47 @@ function initChart() {
     crosshairMarkerVisible: false, lastValueVisible: true, priceLineVisible: false, title: "SL"
   });
   window.addEventListener("resize", () => chart.applyOptions({ width: container.clientWidth }));
+}
+
+// S/R price lines holder (we use candleSeries.createPriceLine)
+let srPriceLines = [];
+
+function clearSR() {
+  for (const pl of srPriceLines) {
+    try { candleSeries.removePriceLine(pl); } catch(e) {}
+  }
+  srPriceLines = [];
+}
+
+function renderSR(sr) {
+  clearSR();
+  if (!currentShowSR || !sr) return;
+  
+  // Resistance (red)
+  for (const r of (sr.resistance || [])) {
+    const pl = candleSeries.createPriceLine({
+      price: r.price,
+      color: "rgba(251, 113, 133, 0.7)",
+      lineWidth: 1,
+      lineStyle: 2,  // dashed
+      axisLabelVisible: true,
+      title: "R" + (r.strength > 1 ? "×" + r.strength : ""),
+    });
+    srPriceLines.push(pl);
+  }
+  
+  // Support (green)
+  for (const s of (sr.support || [])) {
+    const pl = candleSeries.createPriceLine({
+      price: s.price,
+      color: "rgba(52, 211, 153, 0.7)",
+      lineWidth: 1,
+      lineStyle: 2,
+      axisLabelVisible: true,
+      title: "S" + (s.strength > 1 ? "×" + s.strength : ""),
+    });
+    srPriceLines.push(pl);
+  }
 }
 
 
@@ -163,6 +209,9 @@ function updateChart(data) {
   }
   markers.sort((a, b) => a.time - b.time);
   candleSeries.setMarkers(markers);
+  
+  // S/R levels
+  renderSR(data.sr);
   
   // TP/SL lines (filtered by toggle)
   if (data.tp_line && currentShowTpSl) {
@@ -263,6 +312,10 @@ async function updateStatus() {
       currentShowTpSl = data.show_tp_sl;
       if ($("showTpSl")) $("showTpSl").value = String(data.show_tp_sl);
     }
+    if (data.show_sr !== undefined && data.show_sr !== currentShowSR) {
+      currentShowSR = data.show_sr;
+      if ($("showSR")) $("showSR").value = String(data.show_sr);
+    }
     
     // Sync entry-only settings if user hasn't been editing
     if (data.entry_only_settings) {
@@ -286,11 +339,11 @@ function syncEntryOnlySettings(s) {
   if ($("eo_max_hold")) $("eo_max_hold").value = s.max_hold_bars || 144;
   if ($("eo_cooldown")) $("eo_cooldown").value = s.cooldown_bars !== undefined ? s.cooldown_bars : 6;
   if ($("eo_smart_reverse")) $("eo_smart_reverse").value = String(s.smart_reverse !== false);
-  if (s.ladder && s.ladder.length) {
-    renderLadder(s.ladder);
-  } else {
-    renderLadder(DEFAULT_LADDER);
-  }
+  const buyL = (s.buy_ladder && s.buy_ladder.length) ? s.buy_ladder : DEFAULT_BUY_LADDER;
+  const sellL = (s.sell_ladder && s.sell_ladder.length) ? s.sell_ladder : DEFAULT_SELL_LADDER;
+  renderBothLadders(buyL, sellL);
+  if ($("eo_time_no_profit")) $("eo_time_no_profit").value = s.exit_after_no_profit_bars !== undefined ? s.exit_after_no_profit_bars : 8;
+  if ($("eo_time_loss")) $("eo_time_loss").value = s.exit_after_loss_bars !== undefined ? s.exit_after_loss_bars : 15;
   updateExitModeUI();
 }
 
@@ -404,6 +457,7 @@ async function applyShowToggles() {
   currentShowSignals = $("showSignals").value === "true";
   currentShowTrades = $("showTrades").value === "true";
   currentShowTpSl = $("showTpSl").value === "true";
+  currentShowSR = $("showSR").value === "true";
   try {
     await fetch("/api/show-markers", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -411,6 +465,7 @@ async function applyShowToggles() {
         show_signals: currentShowSignals,
         show_trades: currentShowTrades,
         show_tp_sl: currentShowTpSl,
+        show_sr: currentShowSR,
       }),
     });
     await tickChart();
@@ -438,8 +493,8 @@ async function applySupertrendSettings() {
 }
 
 // ----------- Step Ladder editor -----------
-function renderLadder(ladder) {
-  const container = $("ladderRows");
+function renderLadderRows(containerId, ladder, sideKey) {
+  const container = $(containerId);
   if (!container) return;
   container.innerHTML = "";
   for (let i = 0; i < ladder.length; i++) {
@@ -447,22 +502,28 @@ function renderLadder(ladder) {
     const div = document.createElement("div");
     div.className = "ladder-row";
     div.innerHTML = `
-      <input type="number" step="0.01" min="0" value="${row[0]}" data-idx="${i}" data-field="trigger">
+      <input type="number" step="0.01" min="0" value="${row[0]}" data-side="${sideKey}" data-idx="${i}" data-field="trigger">
       <span class="arrow">→</span>
-      <input type="number" step="0.01" min="0" value="${row[1]}" data-idx="${i}" data-field="lock">
-      <button onclick="removeLadderRow(${i})">✕</button>
+      <input type="number" step="0.01" min="0" value="${row[1]}" data-side="${sideKey}" data-idx="${i}" data-field="lock">
+      <button onclick="removeLadderRow('${sideKey}', ${i})">✕</button>
     `;
     container.appendChild(div);
   }
   const addBtn = document.createElement("button");
   addBtn.className = "add-ladder-btn";
   addBtn.textContent = "+ إضافة مستوى";
-  addBtn.onclick = addLadderRow;
+  addBtn.onclick = () => addLadderRow(sideKey);
   container.appendChild(addBtn);
 }
 
-function getLadderFromUI() {
-  const inputs = $("ladderRows").querySelectorAll(".ladder-row");
+function renderBothLadders(buyLadder, sellLadder) {
+  renderLadderRows("buyLadderRows", buyLadder, "buy");
+  renderLadderRows("sellLadderRows", sellLadder, "sell");
+}
+
+function getLadderFromUI(sideKey) {
+  const containerId = sideKey === "buy" ? "buyLadderRows" : "sellLadderRows";
+  const inputs = $(containerId).querySelectorAll(".ladder-row");
   const ladder = [];
   inputs.forEach(row => {
     const trigger = parseFloat(row.querySelector('[data-field="trigger"]').value);
@@ -475,28 +536,29 @@ function getLadderFromUI() {
   return ladder;
 }
 
-function removeLadderRow(idx) {
-  const current = getLadderFromUI();
+function removeLadderRow(sideKey, idx) {
+  const current = getLadderFromUI(sideKey);
   current.splice(idx, 1);
-  renderLadder(current);
+  const containerId = sideKey === "buy" ? "buyLadderRows" : "sellLadderRows";
+  renderLadderRows(containerId, current, sideKey);
 }
 
-function addLadderRow() {
-  const current = getLadderFromUI();
-  // Suggest a new row above the last
-  let newTrigger = 1.5, newLock = 1.0;
+function addLadderRow(sideKey) {
+  const current = getLadderFromUI(sideKey);
+  let newTrigger = 1.5, newLock = 1.4;
   if (current.length > 0) {
     const last = current[current.length - 1];
     newTrigger = last[0] * 1.5;
-    newLock = newTrigger * 0.72;
+    newLock = newTrigger * (sideKey === "buy" ? 0.93 : 0.85);
   }
   current.push([newTrigger, newLock]);
-  renderLadder(current);
+  const containerId = sideKey === "buy" ? "buyLadderRows" : "sellLadderRows";
+  renderLadderRows(containerId, current, sideKey);
 }
 
 function resetLadderDefault() {
-  renderLadder(DEFAULT_LADDER);
-  showToast("استرجاع الجدول الافتراضي");
+  renderBothLadders(DEFAULT_BUY_LADDER, DEFAULT_SELL_LADDER);
+  showToast("استرجاع الجدول الافتراضي للاثنين");
 }
 
 function updateExitModeUI() {
@@ -525,14 +587,20 @@ async function applyEntryOnlySettings() {
     body.buy_sl_pct = parseFloat($("eo_buy_sl").value);
     body.sell_sl_pct = parseFloat($("eo_sell_sl").value);
   } else if (exitMode === "ladder") {
-    const ladder = getLadderFromUI();
-    if (ladder.length === 0) {
-      showToast("⚠ الـladder فاضي — يجب إضافة مستوى واحد على الأقل");
+    const buyLadder = getLadderFromUI("buy");
+    const sellLadder = getLadderFromUI("sell");
+    if (buyLadder.length === 0 || sellLadder.length === 0) {
+      showToast("⚠ الـladder فاضي — يجب إضافة مستوى لكل من BUY و SELL");
       return;
     }
-    body.ladder = ladder;
+    body.buy_ladder = buyLadder;
+    body.sell_ladder = sellLadder;
     body.use_ladder = true;
   }
+  
+  // Add time-stops
+  body.exit_after_no_profit_bars = parseInt($("eo_time_no_profit").value) || 0;
+  body.exit_after_loss_bars = parseInt($("eo_time_loss").value) || 0;
   
   try {
     await fetch("/api/entry-only-settings", {
@@ -587,7 +655,7 @@ function showToast(msg) {
 // ----------- Init -----------
 window.addEventListener("DOMContentLoaded", () => {
   initChart();
-  renderLadder(DEFAULT_LADDER);
+  renderBothLadders(DEFAULT_BUY_LADDER, DEFAULT_SELL_LADDER);
   updateExitModeUI();
   
   // Initial load
